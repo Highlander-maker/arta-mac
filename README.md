@@ -65,7 +65,7 @@ which owns its permission via its bundle.
 - [x] Phase 0 — full-duplex Core Audio + sample-exact delay recovery (spike)
 - [x] Phase 1 — sweep → IR → gated FR, smoothing, overlays/targets, `.pir`/`.frd`
 - [x] Phase 3 (core) — Schroeder decay, RT60/EDT/C50/C80/D50/Ts wideband + per band, STI
-- [ ] Phase 2 — ETC / step response / CSD waterfall views (DSP done, views pending)
+- [x] Phase 2 — ETC / step response / CSD waterfall views
 - [ ] Real-time modes — spectrum analyzer, dual-channel FR with live averaging
 - [ ] Phase 4 — SPL meter, octave/third-octave meters, noise ratings
 - [ ] Phase 5 — directivity patterns, polar plots, turntable automation

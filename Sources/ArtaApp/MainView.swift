@@ -8,6 +8,7 @@ struct MainView: View {
     enum Tab: String, CaseIterable {
         case frequencyResponse = "Frequency Response"
         case impulse = "Impulse Response"
+        case analysis = "Analysis"
         case room = "Room Acoustics"
     }
 
@@ -28,6 +29,7 @@ struct MainView: View {
                 switch tab {
                 case .frequencyResponse: FRPanel()
                 case .impulse: IRPanel()
+                case .analysis: AnalysisPanel()
                 case .room: RoomPanel()
                 }
 
