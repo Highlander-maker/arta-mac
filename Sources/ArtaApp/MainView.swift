@@ -15,14 +15,21 @@ struct MainView: View {
     var body: some View {
         NavigationSplitView {
             SettingsSidebar()
-                .navigationSplitViewColumnWidth(min: 260, ideal: 280)
+                .navigationSplitViewColumnWidth(min: 270, ideal: 290)
         } detail: {
             VStack(spacing: 0) {
-                Picker("", selection: $tab) {
-                    ForEach(Tab.allCases, id: \.self) { Text($0.rawValue) }
+                HStack(spacing: 12) {
+                    Picker("", selection: $tab) {
+                        ForEach(Tab.allCases, id: \.self) { Text($0.rawValue) }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 520)
+
+                    Spacer()
+                    MeasurementReadouts()
                 }
-                .pickerStyle(.segmented)
-                .padding(8)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
 
                 Divider()
 
@@ -34,17 +41,61 @@ struct MainView: View {
                 }
 
                 Divider()
-                HStack {
+                HStack(spacing: 8) {
                     if model.isMeasuring { ProgressView().controlSize(.small) }
+                    if model.generatorRunning {
+                        Label("GEN", systemImage: "dot.radiowaves.left.and.right")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(Color.red.opacity(0.85)))
+                    }
                     Text(model.statusMessage)
                         .font(.system(size: 11, design: .monospaced))
                         .lineLimit(2)
                         .foregroundColor(.secondary)
                     Spacer()
                 }
-                .padding(6)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
             }
         }
+    }
+}
+
+/// Delay / input peak / correlation chips from the last measurement.
+struct MeasurementReadouts: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if !model.impulseResponse.isEmpty {
+                chip("delay", String(format: "%.2f ms",
+                                     model.systemDelaySamples / model.irSampleRate * 1000))
+            }
+            if let peak = model.lastPeakDBFS {
+                chip("in pk", String(format: "%.1f dBFS", peak),
+                     warn: peak < -60 || peak > -3)
+            }
+            if let corr = model.lastCorrelationDB {
+                chip("corr", String(format: "%.0f dB", corr), warn: corr < -20)
+            }
+        }
+    }
+
+    private func chip(_ title: String, _ value: String, warn: Bool = false) -> some View {
+        HStack(spacing: 4) {
+            Text(title.uppercased())
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundColor(warn ? .orange : .primary)
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(RoundedRectangle(cornerRadius: 5).fill(Color.primary.opacity(0.06)))
+        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
     }
 }
 
@@ -52,6 +103,9 @@ struct MainView: View {
 
 struct SettingsSidebar: View {
     @EnvironmentObject var model: AppModel
+
+    /// Common alignment frequencies: sub/top crossover region + reference tones.
+    private let quickFrequencies: [Double] = [40, 63, 80, 100, 125, 1000, 4000, 10_000]
 
     var body: some View {
         Form {
@@ -76,19 +130,40 @@ struct SettingsSidebar: View {
             }
 
             Section("Sweep") {
-                HStack {
-                    Text("From")
-                    TextField("Hz", value: $model.f1, format: .number)
-                    Text("to")
-                    TextField("Hz", value: $model.f2, format: .number)
-                    Text("Hz")
+                Picker("Preset", selection: $model.sweepPreset) {
+                    ForEach(SweepPreset.allCases) { preset in
+                        Text(preset.rawValue).tag(preset)
+                    }
+                }
+                .onChange(of: model.sweepPreset) { newValue in
+                    model.applyPreset(newValue)
+                }
+                Text(model.sweepPreset.subtitle)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+
+                LabeledContent("Range") {
+                    HStack(spacing: 4) {
+                        TextField("", value: $model.f1, format: .number.grouping(.never))
+                            .frame(width: 60)
+                            .multilineTextAlignment(.trailing)
+                            .onChange(of: model.f1) { _ in model.sweepFieldEdited() }
+                        Text("–").foregroundColor(.secondary)
+                        TextField("", value: $model.f2, format: .number.grouping(.never))
+                            .frame(width: 60)
+                            .multilineTextAlignment(.trailing)
+                            .onChange(of: model.f2) { _ in model.sweepFieldEdited() }
+                        Text("Hz").foregroundColor(.secondary)
+                    }
                 }
                 Picker("Length", selection: $model.sweepDuration) {
                     Text("0.5 s").tag(0.5)
                     Text("1 s").tag(1.0)
                     Text("2 s").tag(2.0)
+                    Text("3 s").tag(3.0)
                     Text("4 s").tag(4.0)
                 }
+                .onChange(of: model.sweepDuration) { _ in model.sweepFieldEdited() }
                 Picker("Level", selection: $model.outputLevelDB) {
                     Text("-6 dBFS").tag(-6.0)
                     Text("-12 dBFS").tag(-12.0)
@@ -98,9 +173,11 @@ struct SettingsSidebar: View {
                 Picker("Decay wait", selection: $model.postSilence) {
                     Text("0.5 s").tag(0.5)
                     Text("1 s").tag(1.0)
+                    Text("1.5 s").tag(1.5)
                     Text("2 s").tag(2.0)
                     Text("4 s").tag(4.0)
                 }
+                .onChange(of: model.postSilence) { _ in model.sweepFieldEdited() }
             }
 
             Section {
@@ -114,6 +191,72 @@ struct SettingsSidebar: View {
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(model.isMeasuring)
                 .controlSize(.large)
+            }
+
+            Section("Generator") {
+                Picker("Signal", selection: $model.generatorMode) {
+                    ForEach(GeneratorMode.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: model.generatorMode) { _ in model.restartGeneratorIfRunning() }
+
+                if model.generatorMode != .pink {
+                    LabeledContent(model.generatorMode == .sine ? "Frequency" : "Centre") {
+                        HStack(spacing: 4) {
+                            TextField("", value: $model.generatorFrequency, format: .number.grouping(.never))
+                                .frame(width: 68)
+                                .multilineTextAlignment(.trailing)
+                                .onSubmit { model.restartGeneratorIfRunning() }
+                            Text("Hz").foregroundColor(.secondary)
+                        }
+                    }
+                    // Quick-pick chips for the usual alignment frequencies.
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 4),
+                              spacing: 4) {
+                        ForEach(quickFrequencies, id: \.self) { f in
+                            Button {
+                                model.generatorFrequency = f
+                                model.restartGeneratorIfRunning()
+                            } label: {
+                                Text(f >= 1000 ? "\(Int(f / 1000))k" : "\(Int(f))")
+                                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .tint(model.generatorFrequency == f ? .accentColor : nil)
+                        }
+                    }
+                }
+
+                if model.generatorMode == .pinkBand {
+                    Picker("Bandwidth", selection: $model.generatorFraction) {
+                        Text("1/1 octave").tag(1)
+                        Text("1/3 octave").tag(3)
+                    }
+                    .onChange(of: model.generatorFraction) { _ in model.restartGeneratorIfRunning() }
+                }
+
+                HStack {
+                    Text("Level")
+                    Slider(value: $model.generatorLevelDB, in: -50...0, step: 1) { _ in
+                        model.generatorLevelChanged()
+                    }
+                    Text(String(format: "%.0f dB", model.generatorLevelDB))
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 46, alignment: .trailing)
+                }
+
+                Button {
+                    model.toggleGenerator()
+                } label: {
+                    Label(model.generatorRunning ? "Stop" : "Start",
+                          systemImage: model.generatorRunning ? "stop.fill" : "play.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .tint(model.generatorRunning ? .red : nil)
+                .keyboardShortcut("g", modifiers: .command)
+                .disabled(model.isMeasuring)
             }
 
             Section("Files") {
@@ -147,6 +290,9 @@ struct FRPanel: View {
                 .frame(maxWidth: 220)
                 .onChange(of: model.smoothing) { _ in model.recomputeFrequencyResponse() }
 
+                Toggle("Phase", isOn: $model.showPhase)
+                    .toggleStyle(.checkbox)
+
                 Spacer()
 
                 Button("Set as overlay") { model.setCurrentAsOverlay() }
@@ -157,8 +303,13 @@ struct FRPanel: View {
             }
             .padding(8)
 
-            FRPlotView(curves: allCurves)
-                .padding([.leading, .trailing, .bottom], 8)
+            FRPlotView(
+                curves: allCurves,
+                phase: model.currentPhase,
+                phaseFrequencies: model.currentFR?.frequencies ?? [],
+                showPhase: model.showPhase
+            )
+            .padding([.leading, .trailing, .bottom], 8)
         }
     }
 
@@ -181,11 +332,6 @@ struct IRPanel: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer()
-                if !model.impulseResponse.isEmpty {
-                    Text(String(format: "delay est. %.1f ms",
-                                model.systemDelaySamples / model.irSampleRate * 1000))
-                        .font(.system(size: 11, design: .monospaced))
-                }
                 Button("Cursor to peak") {
                     model.cursorSample = max(0, model.peakIndex(of: model.impulseResponse) - 20)
                     model.recomputeFrequencyResponse()

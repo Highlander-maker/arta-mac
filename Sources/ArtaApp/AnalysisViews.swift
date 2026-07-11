@@ -72,18 +72,21 @@ struct AnalysisPanel: View {
             var newETC: [Float] = []
             var newStep: [Float] = []
             var newCSD: [[Float]] = []
+            let from = min(max(0, cursor), ir.count - 1)
             switch currentMode {
             case .etc:
-                // Window to keep the interesting 1.5 s — full multi-second IRs
-                // make the Hilbert FFT needlessly huge.
-                let window = Array(ir.prefix(min(ir.count, Int(fs * 1.5))))
+                // From the cursor (just ahead of the direct sound), 1.5 s max —
+                // skips the propagation-delay lead-in and keeps the Hilbert FFT sane.
+                let window = Array(ir[from..<min(ir.count, from + Int(fs * 1.5))])
                 newETC = Analysis.energyTimeCurveDB(ir: window)
             case .step:
-                let window = Array(ir.prefix(min(ir.count, Int(fs * 0.05) + cursor)))
+                // Integrate from the cursor, not from t=0 — the lead-in silence
+                // only adds offset drift before the wavefront.
+                let window = Array(ir[from..<min(ir.count, from + Int(fs * 0.05))])
                 newStep = Analysis.stepResponse(ir: window)
             case .csd:
                 newCSD = Analysis.cumulativeSpectralDecay(
-                    ir: ir, startIndex: max(0, cursor),
+                    ir: ir, startIndex: from,
                     fftLength: 1024, blockShift: 8, maxBlocks: 50)
             }
             DispatchQueue.main.async {
@@ -109,55 +112,57 @@ struct TimeCurvePlot: View {
     let emptyHint: String
 
     var body: some View {
-        Canvas { context, size in
-            guard !values.isEmpty else {
-                context.draw(Text(emptyHint).font(.callout).foregroundColor(.secondary),
-                             at: CGPoint(x: size.width / 2, y: size.height / 2))
-                return
+        PlotStyle.panel(
+            Canvas { context, size in
+                guard !values.isEmpty else {
+                    context.draw(Text(emptyHint).font(.callout).foregroundColor(PlotStyle.label),
+                                 at: CGPoint(x: size.width / 2, y: size.height / 2))
+                    return
+                }
+                drawGrid(context: context, size: size)
+                var path = Path()
+                var started = false
+                let stride = max(1, values.count / Int(max(size.width, 1)) / 2)
+                for i in Swift.stride(from: 0, to: values.count, by: stride) {
+                    let x = CGFloat(i) / CGFloat(values.count) * size.width
+                    let yNorm = (yTop - Double(values[i])) / yRange
+                    let y = CGFloat(min(max(yNorm, 0), 1)) * size.height
+                    if started { path.addLine(to: CGPoint(x: x, y: y)) }
+                    else { path.move(to: CGPoint(x: x, y: y)); started = true }
+                }
+                context.stroke(path, with: .color(PlotStyle.trace),
+                               style: StrokeStyle(lineWidth: 1.3, lineJoin: .round))
             }
-            drawGrid(context: context, size: size)
-            var path = Path()
-            var started = false
-            let stride = max(1, values.count / Int(max(size.width, 1)) / 2)
-            for i in Swift.stride(from: 0, to: values.count, by: stride) {
-                let x = CGFloat(i) / CGFloat(values.count) * size.width
-                let yNorm = (yTop - Double(values[i])) / yRange
-                let y = CGFloat(min(max(yNorm, 0), 1)) * size.height
-                if started { path.addLine(to: CGPoint(x: x, y: y)) }
-                else { path.move(to: CGPoint(x: x, y: y)); started = true }
-            }
-            context.stroke(path, with: .color(.blue), lineWidth: 1.2)
-        }
-        .background(Color(nsColor: .textBackgroundColor))
+        )
     }
 
     private func drawGrid(context: GraphicsContext, size: CGSize) {
-        let gridColor = Color.gray.opacity(0.25)
         for fraction in [0.25, 0.5, 0.75] {
             var h = Path()
             h.move(to: CGPoint(x: 0, y: size.height * fraction))
             h.addLine(to: CGPoint(x: size.width, y: size.height * fraction))
-            context.stroke(h, with: .color(gridColor), lineWidth: 0.5)
+            context.stroke(h, with: .color(PlotStyle.gridMinor), lineWidth: 0.5)
             var v = Path()
             v.move(to: CGPoint(x: size.width * fraction, y: 0))
             v.addLine(to: CGPoint(x: size.width * fraction, y: size.height))
-            context.stroke(v, with: .color(gridColor), lineWidth: 0.5)
+            context.stroke(v, with: .color(PlotStyle.gridMinor), lineWidth: 0.5)
         }
         let totalMs = Double(values.count) / sampleRate * 1000
         for fraction in stride(from: 0.0, through: 1.0, by: 0.25) {
+            let anchor: UnitPoint = fraction == 0 ? .leading : fraction == 1 ? .trailing : .center
+            let x = CGFloat(fraction) * size.width + (fraction == 0 ? 4 : fraction == 1 ? -4 : 0)
             context.draw(
                 Text(String(format: "%.0f ms", totalMs * fraction))
-                    .font(.system(size: 9)).foregroundColor(.secondary),
-                at: CGPoint(x: CGFloat(fraction) * size.width + (fraction == 0 ? 20 : -24),
-                            y: size.height - 8))
+                    .font(PlotStyle.labelFont).foregroundColor(PlotStyle.label),
+                at: CGPoint(x: x, y: size.height - 9), anchor: anchor)
         }
         if !yLabel.isEmpty {
             for fraction in [0.0, 0.5, 1.0] {
                 let value = yTop - yRange * fraction
                 context.draw(
                     Text(String(format: "%.0f %@", value, yLabel))
-                        .font(.system(size: 9)).foregroundColor(.secondary),
-                    at: CGPoint(x: 18, y: CGFloat(fraction) * size.height * 0.96 + 6))
+                        .font(PlotStyle.labelFont).foregroundColor(PlotStyle.label),
+                    at: CGPoint(x: 4, y: CGFloat(fraction) * size.height * 0.96 + 6), anchor: .leading)
             }
         }
     }
@@ -176,9 +181,13 @@ struct CSDWaterfallPlot: View {
     private var fHigh: Double { min(20_000, sampleRate / 2) }
 
     var body: some View {
+        PlotStyle.panel(canvas)
+    }
+
+    private var canvas: some View {
         Canvas { context, size in
             guard !slices.isEmpty else {
-                context.draw(Text(emptyHint).font(.callout).foregroundColor(.secondary),
+                context.draw(Text(emptyHint).font(.callout).foregroundColor(PlotStyle.label),
                              at: CGPoint(x: size.width / 2, y: size.height / 2))
                 return
             }
@@ -223,14 +232,13 @@ struct CSDWaterfallPlot: View {
                 let xNorm = (log10(f) - logLow) / (logHigh - logLow)
                 let label = f >= 1000 ? "\(Int(f / 1000))k" : "\(Int(f))"
                 context.draw(
-                    Text(label).font(.system(size: 9)).foregroundColor(.secondary),
-                    at: CGPoint(x: CGFloat(xNorm) * plotW, y: size.height - 8))
+                    Text(label).font(PlotStyle.labelFont).foregroundColor(PlotStyle.label),
+                    at: CGPoint(x: CGFloat(xNorm) * plotW, y: size.height - 9))
             }
             context.draw(
                 Text("0 to -\(Int(dbRange)) dB · front slice = t0, back = later decay")
-                    .font(.system(size: 9)).foregroundColor(.secondary),
-                at: CGPoint(x: size.width - 130, y: 10))
+                    .font(PlotStyle.labelFont).foregroundColor(PlotStyle.label),
+                at: CGPoint(x: size.width - 8, y: 10), anchor: .trailing)
         }
-        .background(Color(nsColor: .textBackgroundColor))
     }
 }

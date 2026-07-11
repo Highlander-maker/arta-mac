@@ -115,4 +115,22 @@ enum AudioDevices {
             throw AudioError.coreAudio(status, "setting \(what) device to ID \(deviceID)")
         }
     }
+
+    /// The device the node's AUHAL is currently bound to (on macOS this is the
+    /// engine's private aggregate until a device is set explicitly).
+    static func currentDeviceID(on node: AVAudioIONode) -> AudioDeviceID? {
+        guard let unit = node.audioUnit else { return nil }
+        var id = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioUnitGetProperty(
+            unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &id, &size)
+        return status == noErr ? id : nil
+    }
+
+    /// Set only when actually different — re-setting the shared AUHAL's device
+    /// fails with kAudioUnitErr_InvalidPropertyValue and corrupts its state.
+    static func ensureDevice(_ deviceID: AudioDeviceID, on node: AVAudioIONode, what: String) throws {
+        if currentDeviceID(on: node) == deviceID { return }
+        try setDevice(deviceID, on: node, what: what)
+    }
 }

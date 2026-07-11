@@ -67,11 +67,24 @@ final class MeasurementEngine {
         try ensureMicrophonePermission()
 
         let engine = AVAudioEngine()
-        if let outID = settings.outputDeviceID {
-            try AudioDevices.setDevice(outID, on: engine.outputNode, what: "output")
-        }
-        if let inID = settings.inputDeviceID {
-            try AudioDevices.setDevice(inID, on: engine.inputNode, what: "input")
+
+        // macOS quirk: inputNode and outputNode share ONE AUHAL, which the
+        // engine binds to a private aggregate of the system default devices.
+        // Setting a device on it is only valid once, so the supported configs
+        // are: (a) system defaults — touch nothing, the aggregate handles
+        // full duplex; (b) one full-duplex interface for both directions —
+        // a single set (the reference configuration: one clock).
+        let defIn = AudioDevices.defaultDeviceID(input: true)
+        let defOut = AudioDevices.defaultDeviceID(input: false)
+        let wantIn = settings.inputDeviceID ?? defIn
+        let wantOut = settings.outputDeviceID ?? defOut
+        if let dev = wantIn, wantIn == wantOut {
+            try AudioDevices.ensureDevice(dev, on: engine.inputNode, what: "measurement I/O")
+        } else if wantIn != defIn || wantOut != defOut {
+            throw AudioError.message(
+                "Split input/output devices aren't supported by the macOS audio engine. "
+                + "Pick the same interface for input and output (best: one clock), "
+                + "or set both to the system default devices.")
         }
 
         let inputFormat = engine.inputNode.outputFormat(forBus: 0)
@@ -86,9 +99,14 @@ final class MeasurementEngine {
         let outRate = outputFormat.sampleRate
         let amplitude = pow(10.0, settings.amplitudeDB / 20.0)
 
+        // Keep the sweep inside both converters' Nyquist with margin.
+        let fMax = min(inRate, outRate) * 0.475
+        let f1 = min(max(settings.f1, 1.0), fMax - 1.0)
+        let f2 = min(max(settings.f2, f1 + 1.0), fMax)
+
         // Sweep at the output rate for playback.
         let playSweep = SignalGenerator.logSweep(
-            f1: settings.f1, f2: settings.f2,
+            f1: f1, f2: f2,
             duration: settings.sweepDuration, sampleRate: outRate, amplitude: amplitude)
         let preFrames = Int(settings.preSilence * outRate)
         let postFrames = Int(settings.postSilence * outRate)
@@ -166,7 +184,7 @@ final class MeasurementEngine {
 
         // Reference sweep at the input rate for analysis.
         let reference = outRate == inRate ? playSweep : SignalGenerator.logSweep(
-            f1: settings.f1, f2: settings.f2,
+            f1: f1, f2: f2,
             duration: settings.sweepDuration, sampleRate: inRate, amplitude: amplitude)
 
         let responseStart = max(0, Int(sweepStartSample))

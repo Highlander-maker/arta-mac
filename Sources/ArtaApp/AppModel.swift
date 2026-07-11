@@ -13,6 +13,48 @@ struct FRCurve: Identifiable {
     var isTarget: Bool = false
 }
 
+/// Band-focused sweep presets. Concentrating the sweep in the band under test
+/// puts all the excitation energy where you're working — longer LF sweeps for
+/// subs (better S/N below 100 Hz), shorter full/HF sweeps for speed.
+enum SweepPreset: String, CaseIterable, Identifiable {
+    case fullRange = "Full range"
+    case sub = "Subwoofer"
+    case crossover = "Sub/Top crossover"
+    case midHigh = "Mid–High (1 kHz+)"
+    case custom = "Custom"
+
+    var id: String { rawValue }
+
+    /// (f1, f2, sweepSeconds, decayWaitSeconds); nil = leave fields alone.
+    var settings: (f1: Double, f2: Double, duration: Double, decay: Double)? {
+        switch self {
+        case .fullRange: return (20, 20_000, 1.0, 1.0)
+        case .sub:       return (15, 250, 3.0, 2.0)
+        case .crossover: return (30, 400, 2.0, 1.5)
+        case .midHigh:   return (800, 20_000, 1.0, 0.5)
+        case .custom:    return nil
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .fullRange: return "20 Hz – 20 kHz · 1 s"
+        case .sub:       return "15 – 250 Hz · 3 s"
+        case .crossover: return "30 – 400 Hz · 2 s"
+        case .midHigh:   return "800 Hz – 20 kHz · 1 s"
+        case .custom:    return "manual range"
+        }
+    }
+}
+
+/// Generator signal choices for alignment tones.
+enum GeneratorMode: String, CaseIterable, Identifiable {
+    case sine = "Sine"
+    case pink = "Pink noise"
+    case pinkBand = "Pink band"
+    var id: String { rawValue }
+}
+
 final class AppModel: ObservableObject {
 
     // MARK: Devices & measurement settings
@@ -27,6 +69,16 @@ final class AppModel: ObservableObject {
     @Published var f2 = 20_000.0
     @Published var outputLevelDB = -12.0
     @Published var postSilence = 1.0
+    @Published var sweepPreset: SweepPreset = .fullRange
+
+    // MARK: Generator (alignment tones)
+
+    @Published var generatorMode: GeneratorMode = .sine
+    @Published var generatorFrequency = 1000.0
+    @Published var generatorFraction = 1          // pink band: 1/1 or 1/3 octave
+    @Published var generatorLevelDB = -20.0
+    @Published var generatorRunning = false
+    private let generator = GeneratorEngine()
 
     // MARK: Measurement state
 
@@ -35,6 +87,8 @@ final class AppModel: ObservableObject {
     @Published var impulseResponse: [Float] = []
     @Published var irSampleRate: Double = 48000
     @Published var systemDelaySamples: Double = 0
+    @Published var lastPeakDBFS: Float? = nil
+    @Published var lastCorrelationDB: Float? = nil
 
     // IR view state (sample indices)
     @Published var cursorSample: Int = 0
@@ -57,7 +111,7 @@ final class AppModel: ObservableObject {
     @Published var stiResult: STIResult?
 
     private let engine = MeasurementEngine()
-    private let overlayPalette: [Color] = [.teal, .purple, .brown, .green, .pink, .indigo]
+    private let overlayPalette = PlotStyle.overlayPalette
 
     init() {
         refreshDevices()
@@ -71,8 +125,79 @@ final class AppModel: ObservableObject {
         if outputDeviceID == nil { outputDeviceID = AudioDevices.defaultDeviceID(input: false) }
     }
 
+    /// Preset selection writes the sweep fields; manual edits flip back to Custom.
+    func applyPreset(_ preset: SweepPreset) {
+        guard let s = preset.settings else { return }
+        f1 = s.f1
+        f2 = s.f2
+        sweepDuration = s.duration
+        postSilence = s.decay
+    }
+
+    /// Field onChange fires on the next view cycle, so a transient "applying"
+    /// flag can't work — instead flip to Custom only when the fields genuinely
+    /// no longer match the selected preset.
+    func sweepFieldEdited() {
+        guard let s = sweepPreset.settings else { return }
+        if f1 != s.f1 || f2 != s.f2 || sweepDuration != s.duration || postSilence != s.decay {
+            sweepPreset = .custom
+        }
+    }
+
+    // MARK: Generator
+
+    func toggleGenerator() {
+        if generatorRunning {
+            generator.stop()
+            generatorRunning = false
+            statusMessage = "Generator stopped."
+            return
+        }
+        let kind: GeneratorEngine.Kind
+        switch generatorMode {
+        case .sine: kind = .sine(frequency: generatorFrequency)
+        case .pink: kind = .pink
+        case .pinkBand: kind = .pinkBand(center: generatorFrequency, fraction: generatorFraction)
+        }
+        do {
+            try generator.start(
+                kind: kind, levelDB: generatorLevelDB,
+                outputDeviceID: outputDeviceID, outputChannel: outputChannel)
+            generatorRunning = true
+            switch generatorMode {
+            case .sine:
+                statusMessage = String(format: "Generator: %.0f Hz sine @ %.0f dBFS on out %d.",
+                                       generatorFrequency, generatorLevelDB, outputChannel + 1)
+            case .pink:
+                statusMessage = String(format: "Generator: pink noise @ %.0f dBFS on out %d.",
+                                       generatorLevelDB, outputChannel + 1)
+            case .pinkBand:
+                statusMessage = String(format: "Generator: 1/%d-oct pink @ %.0f Hz, %.0f dBFS on out %d.",
+                                       generatorFraction, generatorFrequency, generatorLevelDB, outputChannel + 1)
+            }
+        } catch {
+            statusMessage = "Generator failed: \(error)"
+        }
+    }
+
+    /// Restart with current settings if running (frequency/mode changed).
+    func restartGeneratorIfRunning() {
+        guard generatorRunning else { return }
+        generator.stop()
+        generatorRunning = false
+        toggleGenerator()
+    }
+
+    func generatorLevelChanged() {
+        if generatorRunning { generator.setLevel(dB: generatorLevelDB) }
+    }
+
     func runMeasurement() {
         guard !isMeasuring else { return }
+        if generatorRunning {
+            generator.stop()
+            generatorRunning = false
+        }
         isMeasuring = true
         statusMessage = "Measuring — playing sweep..."
 
@@ -107,6 +232,8 @@ final class AppModel: ObservableObject {
         impulseResponse = result.impulseResponse
         irSampleRate = result.sampleRate
         systemDelaySamples = result.systemDelaySamples
+        lastPeakDBFS = result.capturedPeakDBFS
+        lastCorrelationDB = result.correlationQualityDB
         isMeasuring = false
 
         // Default cursor: just before the IR peak; marker: gate later.
@@ -156,8 +283,13 @@ final class AppModel: ObservableObject {
         } else {
             mags = fr.magnitudeDB()
         }
-        currentPhase = fr.phaseDegrees(removingDelay: Double(gateStart) / irSampleRate)
-        currentFR = FRCurve(name: "Current", frequencies: freqs, magnitudesDB: mags, color: .primary)
+        // The gated FFT's t=0 is the gate start, so only the gate-start → direct
+        // sound pre-delay remains as excess linear phase. Removing it leaves the
+        // response's own phase — the number that matters for alignment.
+        let peakIdx = peakIndex(of: impulseResponse)
+        let preDelay = peakIdx > gateStart ? Double(peakIdx - gateStart) / irSampleRate : 0
+        currentPhase = fr.phaseDegrees(removingDelay: preDelay)
+        currentFR = FRCurve(name: "Current", frequencies: freqs, magnitudesDB: mags, color: PlotStyle.trace)
     }
 
     func recomputeRoomAcoustics() {
@@ -219,7 +351,7 @@ final class AppModel: ObservableObject {
         overlays.append(FRCurve(
             name: url.deletingPathExtension().lastPathComponent,
             frequencies: parsed.frequencies, magnitudesDB: parsed.magnitudesDB,
-            color: .red, isTarget: true))
+            color: PlotStyle.target, isTarget: true))
     }
 
     // MARK: File I/O
@@ -230,6 +362,7 @@ final class AppModel: ObservableObject {
         panel.nameFieldStringValue = "measurement.pir"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         var pir = PIRFile(sampleRate: Int32(irSampleRate), samples: impulseResponse)
+        pir.peakLeft = impulseResponse.map(abs).max() ?? 0
         pir.cursorPosition = Int32(cursorSample)
         pir.markerPosition = Int32(markerSample ?? -1)
         pir.infoText = "Measured with arta-mac"

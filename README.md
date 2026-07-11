@@ -12,7 +12,7 @@ real ARTA (`.pir`, `.frd`).
 | Target | What it is |
 |---|---|
 | `ArtaDSP` | Pure measurement mathematics. FFT, Farina log-sweep generation + deconvolution, GCC delay estimation, averaged H1 estimator with coherence, gate windows, 1/n-octave smoothing, ETC/step response/CSD, minimum phase, 6-pole Butterworth band filters, IEC 61672 A/C weighting, Schroeder decay + ISO 3382 parameters (wideband and per octave band), STI per IEC 60268-16 (male), `.pir`/`.frd` file I/O. No audio, no UI. Fully unit-tested (`swift test`). |
-| `ArtaApp` | The application: SwiftUI shell, device selection, full-duplex sweep measurement via `AVAudioEngine`, log-frequency FR plot with cursor/overlays/targets, IR view with click-to-gate, room acoustics table, STI. |
+| `ArtaApp` | The application: SwiftUI shell, device selection, full-duplex sweep measurement via `AVAudioEngine`, band-focused sweep presets (sub / crossover / mid-high), continuous alignment-tone generator (sine, pink, band-limited pink), log-frequency FR plot with phase trace, cursor/overlays/targets, IR view with click-to-gate, ETC/step/CSD analysis, room acoustics table, STI. |
 | `arta-mac-spike` | Phase 0 de-risking CLI (kept as a diagnostic tool): device listing, sweep generator, DSP selftest, round-trip latency measurement. |
 
 ## Build & run
@@ -28,10 +28,15 @@ First launch will ask for microphone access — that's the measurement input.
 
 ## Measuring
 
-1. Pick output/input devices and channels in the sidebar (same device for
-   both = one clock, the reference configuration).
-2. Set sweep length/level. For rooms use 1–2 s sweeps and a decay wait longer
-   than the reverb tail; for electronics 0.5 s is fine.
+1. Pick output/input devices and channels in the sidebar. **Supported device
+   configs:** the system default devices, or one full-duplex interface selected
+   for both sides (one clock — the reference configuration). Split explicit
+   input/output devices are refused: macOS `AVAudioEngine` runs both directions
+   through a single AUHAL, so they physically can't be honoured.
+2. Pick a sweep preset — Full range, Subwoofer (15–250 Hz, 3 s), Sub/Top
+   crossover (30–400 Hz), Mid–High (800 Hz+) — or set a custom range. Longer
+   band-limited sweeps concentrate energy where you're working (better LF S/N
+   for sub work). For rooms use a decay wait longer than the reverb tail.
 3. **Measure** (⌘R). You get the impulse response, estimated system delay,
    gated frequency response, and room parameters.
 4. In the Impulse tab: click = gate start, shift-click = gate end. The FR tab
@@ -40,6 +45,18 @@ First launch will ask for microphone access — that's the measurement input.
    an `.frd` target (drawn dashed red) — tune the system until the live curve
    sits on the target.
 6. Save the IR as `.pir` (opens in real ARTA), export the FR as `.frd`.
+7. **Phase**: tick the Phase checkbox on the FR tab. The gate-start → direct
+   sound pre-delay is removed automatically, leaving the system's own phase —
+   the number you're matching when aligning sub to tops at the crossover.
+
+## Alignment tones (Generator)
+
+Continuous signals for sub/top delay and polarity work, on the selected
+output channel: steady sine (quick-pick chips at 40/63/80/100/125 Hz and
+1/4/10 kHz), full-range pink noise, and 1/1- or 1/3-octave band-limited pink
+noise for crossover-region checks. Loop-rendered (whole cycles / crossfaded
+seam) so there are no clicks. ⌘G toggles it; starting a measurement stops the
+generator automatically.
 
 ## Diagnostic CLI (Phase 0 spike)
 
