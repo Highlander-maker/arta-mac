@@ -83,6 +83,36 @@ final class ArtaDSPTests: XCTestCase {
         XCTAssertEqual(peakVal, gain, accuracy: 0.1)
     }
 
+    /// Dual-channel loop reference: the excitation is a *captured* signal that is
+    /// NOT a clean generated sweep (here pink noise, standing in for the real
+    /// electrical loop off an interface output). Deconvolving the mic-side
+    /// measurement against that captured reference must still recover the true
+    /// system delay and gain — this is the whole point of the SMAART-style loop:
+    /// whatever actually came out of the converters is the reference, so the
+    /// converter path divides out and only the acoustic time-of-flight remains.
+    func testLoopReferenceRecoversDelayFromNonSweepExcitation() {
+        let captured = SignalGenerator.pinkNoise(count: 48000, seed: 21)
+        let delaySamples = 512
+        let gain: Float = 0.35
+        // Measurement = the same captured drive, delayed (speed of sound) + scaled.
+        var measured = [Float](repeating: 0, count: delaySamples) + captured.map { $0 * gain }
+        measured += [Float](repeating: 0, count: 2000)
+
+        let (lag, corr) = Deconvolution.estimateDelay(reference: captured, measured: measured)
+        XCTAssertEqual(lag, delaySamples, "loop delay estimate")
+        XCTAssertGreaterThan(corr, 0.9, "loop reference correlation")
+
+        let ir = Deconvolution.impulseResponse(excitation: captured, response: measured)
+        var peakIdx = 0
+        var peakVal: Float = 0
+        for (i, v) in ir.enumerated() where abs(v) > peakVal {
+            peakVal = abs(v)
+            peakIdx = i
+        }
+        XCTAssertEqual(peakIdx, delaySamples, "loop IR peak position")
+        XCTAssertEqual(peakVal, gain, accuracy: 0.05, "loop IR peak amplitude")
+    }
+
     // MARK: H1 estimator
 
     func testH1FlatSystemUnityGainAndCoherence() throws {

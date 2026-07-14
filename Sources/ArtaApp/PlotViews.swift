@@ -113,9 +113,13 @@ struct FRPlotView: View {
                            lineWidth: major ? 1 : 0.5)
             if major {
                 let label = f >= 1000 ? "\(Int(f / 1000))k" : "\(Int(f))"
+                // Keep the label inside the plot: the rightmost tick (e.g. 20k)
+                // sits on the edge, so anchor it trailing instead of leading.
+                let nearRight = x > size.width - 24
                 context.draw(
                     Text(label).font(PlotStyle.labelFont).foregroundColor(PlotStyle.label),
-                    at: CGPoint(x: x + 3, y: size.height - 9), anchor: .leading)
+                    at: CGPoint(x: nearRight ? x - 3 : x + 3, y: size.height - 9),
+                    anchor: nearRight ? .trailing : .leading)
             }
         }
         var db = dbTop
@@ -244,9 +248,23 @@ struct FRPlotView: View {
 struct IRPlotView: View {
     let samples: [Float]
     let sampleRate: Double
+    /// Visible sample window (zoom/pan). Caller clamps these to valid bounds.
+    let visibleStart: Int
+    let visibleLength: Int
+    var ampZoom: Double = 1
+    var signalPeak: Float = 1
+    // Frozen reference IR for delay comparison.
+    var frozenSamples: [Float] = []
+    var frozenPeak: Float = 1
+    var frozenPeakIndex: Int = 0
+    var currentPeakIndex: Int = 0
+    var deltaMs: Double? = nil
     @Binding var cursorSample: Int
     @Binding var markerSample: Int?
     var onGateChanged: () -> Void
+    var onZoom: (Double, Int) -> Void
+    var onAmpZoom: (Double) -> Void = { _ in }
+    var onPan: (Int) -> Void = { _ in }
 
     var body: some View {
         GeometryReader { geo in
@@ -254,7 +272,24 @@ struct IRPlotView: View {
                 Canvas { context, size in
                     drawWaveform(context: context, size: size)
                     drawGate(context: context, size: size)
+                    drawDelta(context: context, size: size)
                 }
+                .overlay(
+                    ScrollZoomCatcher { dy, dx, precise, loc, size, shift in
+                        let unit: Double = precise ? 0.006 : 0.15
+                        if shift {
+                            // Vertical (amplitude) magnification.
+                            onAmpZoom(exp(Double(dy) * unit))
+                        } else {
+                            // Scroll up = zoom in, centred on the pointer.
+                            let pivot = sampleFor(x: loc.x, width: size.width)
+                            onZoom(exp(Double(-dy) * unit), pivot)
+                            if abs(dx) > 0 {
+                                onPan(Int(Double(dx) / size.width * Double(visibleLength)))
+                            }
+                        }
+                    }
+                )
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onEnded { value in
@@ -267,13 +302,30 @@ struct IRPlotView: View {
                             onGateChanged()
                         }
                 )
+                .simultaneousGesture(
+                    MagnificationGesture()
+                        .onEnded { scale in
+                            // Pinch out (scale > 1) narrows the window = zoom in.
+                            let pivot = visibleStart + visibleLength / 2
+                            onZoom(1.0 / Double(scale), pivot)
+                        }
+                )
             )
         }
     }
 
+    private func xFor(_ sample: Int, _ width: CGFloat) -> CGFloat {
+        CGFloat(sample - visibleStart) / CGFloat(max(visibleLength, 1)) * width
+    }
+
+    private func clampY(_ y: CGFloat, _ height: CGFloat) -> CGFloat {
+        min(max(y, 0), height)
+    }
+
     private func sampleFor(x: CGFloat, width: CGFloat) -> Int {
         guard width > 0, !samples.isEmpty else { return 0 }
-        return min(max(Int(x / width * CGFloat(samples.count)), 0), samples.count - 1)
+        let s = visibleStart + Int(x / width * CGFloat(visibleLength))
+        return min(max(s, 0), samples.count - 1)
     }
 
     private func drawWaveform(context: GraphicsContext, size: CGSize) {
@@ -290,66 +342,124 @@ struct IRPlotView: View {
         zero.addLine(to: CGPoint(x: size.width, y: mid))
         context.stroke(zero, with: .color(PlotStyle.gridMinor), lineWidth: 1)
 
-        let peak = max(samples.map(abs).max() ?? 1, 1e-9)
-        let columns = Int(size.width)
-        let samplesPerColumn = max(1, samples.count / max(columns, 1))
-
-        var path = Path()
-        for col in 0..<columns {
-            let start = col * samplesPerColumn
-            guard start < samples.count else { break }
-            let end = min(start + samplesPerColumn, samples.count)
-            var lo = samples[start]
-            var hi = samples[start]
-            for i in start..<end {
-                lo = min(lo, samples[i])
-                hi = max(hi, samples[i])
-            }
-            let x = CGFloat(col)
-            let yHi = mid - CGFloat(hi / peak) * mid * 0.9
-            let yLo = mid - CGFloat(lo / peak) * mid * 0.9
-            path.move(to: CGPoint(x: x, y: yHi))
-            path.addLine(to: CGPoint(x: x, y: max(yLo, yHi + 0.5)))
+        // Frozen reference trace (behind), then the current trace on top.
+        if !frozenSamples.isEmpty {
+            drawTrace(context: context, size: size, samples: frozenSamples,
+                      peak: frozenPeak, color: PlotStyle.phase.opacity(0.55), lineWidth: 1)
         }
-        context.stroke(path, with: .color(PlotStyle.trace), lineWidth: 1)
+        drawTrace(context: context, size: size, samples: samples,
+                  peak: signalPeak, color: PlotStyle.trace, lineWidth: 1)
 
-        // Time axis labels.
-        let totalMs = Double(samples.count) / sampleRate * 1000
+        if ampZoom > 1.01 {
+            context.draw(
+                Text(String(format: "×%.0f", ampZoom)).font(PlotStyle.labelFont)
+                    .foregroundColor(PlotStyle.label),
+                at: CGPoint(x: size.width - 6, y: 10), anchor: .trailing)
+        }
+
+        // Time axis labels reflect the visible window.
+        let winStart = min(max(visibleStart, 0), samples.count - 1)
+        let winLen = max(min(visibleStart + visibleLength, samples.count) - winStart, 1)
         for fraction in stride(from: 0.0, through: 1.0, by: 0.25) {
-            let ms = totalMs * fraction
+            let sample = Double(winStart) + Double(winLen) * fraction
+            let ms = sample / sampleRate * 1000
             let anchor: UnitPoint = fraction == 0 ? .leading : fraction == 1 ? .trailing : .center
             let x = CGFloat(fraction) * size.width + (fraction == 0 ? 4 : fraction == 1 ? -4 : 0)
             context.draw(
-                Text(String(format: "%.0f ms", ms)).font(PlotStyle.labelFont)
+                Text(String(format: "%.2f ms", ms)).font(PlotStyle.labelFont)
                     .foregroundColor(PlotStyle.label),
                 at: CGPoint(x: x, y: size.height - 9), anchor: anchor)
         }
     }
 
+    /// Draws one min/max waveform trace across the visible window.
+    private func drawTrace(context: GraphicsContext, size: CGSize,
+                           samples: [Float], peak: Float, color: Color, lineWidth: CGFloat) {
+        guard !samples.isEmpty else { return }
+        let mid = size.height / 2
+        let pk = max(peak, 1e-9)
+        let gain = CGFloat(ampZoom)
+        let columns = max(Int(size.width), 1)
+        let winStart = min(max(visibleStart, 0), samples.count - 1)
+        let winEnd = min(winStart + visibleLength, samples.count)
+        let winLen = max(winEnd - winStart, 1)
+        let samplesPerColumn = Double(winLen) / Double(columns)
+
+        var path = Path()
+        for col in 0..<columns {
+            let s0 = winStart + Int(Double(col) * samplesPerColumn)
+            let s1 = winStart + Int(Double(col + 1) * samplesPerColumn)
+            guard s0 < samples.count else { break }
+            let end = min(max(s1, s0 + 1), samples.count)
+            var lo = samples[s0]
+            var hi = samples[s0]
+            for i in s0..<end {
+                lo = min(lo, samples[i])
+                hi = max(hi, samples[i])
+            }
+            let x = CGFloat(col)
+            let yHi = clampY(mid - CGFloat(hi / pk) * mid * 0.9 * gain, size.height)
+            let yLo = clampY(mid - CGFloat(lo / pk) * mid * 0.9 * gain, size.height)
+            path.move(to: CGPoint(x: x, y: yHi))
+            path.addLine(to: CGPoint(x: x, y: max(yLo, yHi + 0.5)))
+        }
+        context.stroke(path, with: .color(color), lineWidth: lineWidth)
+    }
+
+    /// Marks the frozen reference arrival and calls out the delay difference.
+    private func drawDelta(context: GraphicsContext, size: CGSize) {
+        guard !frozenSamples.isEmpty, let delta = deltaMs else { return }
+        let refX = xFor(frozenPeakIndex, size.width)
+        if refX >= 0, refX <= size.width {
+            var line = Path()
+            line.move(to: CGPoint(x: refX, y: 0))
+            line.addLine(to: CGPoint(x: refX, y: size.height))
+            context.stroke(line, with: .color(PlotStyle.phase),
+                           style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+            context.draw(
+                Text("ref").font(PlotStyle.labelFont).foregroundColor(PlotStyle.phase),
+                at: CGPoint(x: refX + 3, y: 22), anchor: .leading)
+        }
+        let curX = xFor(currentPeakIndex, size.width)
+        let distance = abs(delta) / 1000.0 * 343.0
+        let text = String(format: "Δ %.2f ms   %.2f m", delta, distance)
+        let cx = min(max((refX + curX) / 2, 70), size.width - 70)
+        context.draw(
+            Text(text).font(PlotStyle.readoutFont).foregroundColor(.white),
+            at: CGPoint(x: cx, y: 38), anchor: .center)
+    }
+
     private func drawGate(context: GraphicsContext, size: CGSize) {
         guard !samples.isEmpty else { return }
-        let cursorX = CGFloat(cursorSample) / CGFloat(samples.count) * size.width
-        var cursorPath = Path()
-        cursorPath.move(to: CGPoint(x: cursorX, y: 0))
-        cursorPath.addLine(to: CGPoint(x: cursorX, y: size.height))
-        context.stroke(cursorPath, with: .color(PlotStyle.trace.opacity(0.9)), lineWidth: 1)
+        let cursorX = xFor(cursorSample, size.width)
+        if cursorX >= 0, cursorX <= size.width {
+            var cursorPath = Path()
+            cursorPath.move(to: CGPoint(x: cursorX, y: 0))
+            cursorPath.addLine(to: CGPoint(x: cursorX, y: size.height))
+            context.stroke(cursorPath, with: .color(PlotStyle.trace.opacity(0.9)), lineWidth: 1)
+        }
 
         if let marker = markerSample {
-            let markerX = CGFloat(marker) / CGFloat(samples.count) * size.width
-            var markerPath = Path()
-            markerPath.move(to: CGPoint(x: markerX, y: 0))
-            markerPath.addLine(to: CGPoint(x: markerX, y: size.height))
-            context.stroke(markerPath, with: .color(PlotStyle.target), lineWidth: 1)
+            let markerX = xFor(marker, size.width)
+            if markerX >= 0, markerX <= size.width {
+                var markerPath = Path()
+                markerPath.move(to: CGPoint(x: markerX, y: 0))
+                markerPath.addLine(to: CGPoint(x: markerX, y: size.height))
+                context.stroke(markerPath, with: .color(PlotStyle.target), lineWidth: 1)
+            }
 
-            if markerX > cursorX {
-                let gateRect = CGRect(x: cursorX, y: 0, width: markerX - cursorX, height: size.height)
+            // Fill the gate region (clipped to the visible plot).
+            let gateLo = max(min(cursorX, markerX), 0)
+            let gateHi = min(max(cursorX, markerX), size.width)
+            if gateHi > gateLo {
+                let gateRect = CGRect(x: gateLo, y: 0, width: gateHi - gateLo, height: size.height)
                 context.fill(Path(gateRect), with: .color(PlotStyle.gateFill))
             }
             let gateMs = Double(marker - cursorSample) / sampleRate * 1000
             context.draw(
-                Text(String(format: "gate %.1f ms", gateMs))
+                Text(String(format: "gate %.2f ms", gateMs))
                     .font(PlotStyle.readoutFont).foregroundColor(PlotStyle.trace),
-                at: CGPoint(x: (cursorX + max(markerX, cursorX)) / 2, y: 12))
+                at: CGPoint(x: min(max((gateLo + gateHi) / 2, 40), size.width - 40), y: 12))
         }
     }
 }

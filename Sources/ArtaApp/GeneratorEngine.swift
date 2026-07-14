@@ -19,7 +19,11 @@ final class GeneratorEngine {
     private var player: AVAudioPlayerNode?
     private(set) var isRunning = false
 
-    func start(kind: Kind, levelDB: Double, outputDeviceID: AudioDeviceID?, outputChannel: Int) throws {
+    /// `loopChannel` (optional) mirrors the signal onto a second output — the
+    /// dual-channel loop drive — so the loop input can be gain-staged live
+    /// against the meters before a measurement.
+    func start(kind: Kind, levelDB: Double, outputDeviceID: AudioDeviceID?, outputChannel: Int,
+               loopChannel: Int? = nil) throws {
         stop()
 
         let engine = AVAudioEngine()
@@ -47,8 +51,9 @@ final class GeneratorEngine {
         buffer.frameLength = AVAudioFrameCount(mono.count)
         if let data = buffer.floatChannelData {
             let outCh = min(outputChannel, channels - 1)
+            let loopCh = loopChannel.map { min($0, channels - 1) }
             for ch in 0..<channels {
-                if ch == outCh {
+                if ch == outCh || ch == loopCh {
                     mono.withUnsafeBufferPointer { src in
                         data[ch].update(from: src.baseAddress!, count: src.count)
                     }
@@ -60,8 +65,10 @@ final class GeneratorEngine {
 
         let player = AVAudioPlayerNode()
         engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: nil)
+        // Direct player→outputNode: the mixer's stereo rendering drops discrete
+        // channels past 0, so a generator aimed at out 2+ would go silent (same
+        // fix as MeasurementEngine's loop drive).
+        engine.connect(player, to: engine.outputNode, format: format)
         engine.prepare()
         do {
             try engine.start()

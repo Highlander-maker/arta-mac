@@ -78,6 +78,28 @@ public enum SignalGenerator {
         return out
     }
 
+    /// Short broadband tick: fast attack, exponential decay noise burst. Full-band
+    /// so it's audible through both a sub (low content) and a top (high content) —
+    /// the classic system-tech "click" used to check sub/top alignment by ear.
+    public static func clickBurst(sampleRate: Double, durationMs: Double = 4.0, amplitude: Float = 0.95) -> [Float] {
+        let n = max(4, Int(sampleRate * durationMs / 1000.0))
+        var rng = SeededRNG(seed: 0xC1C4)
+        var out = [Float](repeating: 0, count: n)
+        let decay = 6.0 // time constants across the burst
+        for i in 0..<n {
+            let t = Double(i) / Double(n - 1)
+            let env = exp(-decay * t)
+            let white = Float(rng.nextUniform()) * 2 - 1
+            out[i] = Float(env) * white
+        }
+        let peak = out.map(abs).max() ?? 1
+        if peak > 0 {
+            let g = amplitude / peak
+            for i in 0..<n { out[i] *= g }
+        }
+        return out
+    }
+
     private static func applyFades(_ signal: inout [Float], fadeSamples: Int) {
         let n = signal.count
         let fade = min(fadeSamples, n / 2)

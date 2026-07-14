@@ -99,6 +99,77 @@ struct MeasurementReadouts: View {
     }
 }
 
+// MARK: - Input level meter
+
+/// Live gain-staging meter: RMS fill + decaying peak-hold, per input channel.
+/// Floor -60 dBFS, ceiling 0 dBFS. Zones: green below -18, amber -18...-3 (a
+/// healthy measurement level lives here), red above -3 (clipping risk).
+struct InputMeterView: View {
+    @ObservedObject var meter: InputMeter
+
+    private let floorDB: Float = -60
+    private let ceilingDB: Float = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let error = meter.error {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            } else if meter.rmsDB.isEmpty {
+                Text(meter.running ? "Listening..." : "Meter stopped.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                ForEach(meter.rmsDB.indices, id: \.self) { ch in
+                    channelRow(index: ch)
+                }
+            }
+        }
+    }
+
+    private func channelRow(index: Int) -> some View {
+        let rms = meter.rmsDB[index]
+        let hold = index < meter.holdDB.count ? meter.holdDB[index] : rms
+        return HStack(spacing: 6) {
+            Text("In \(index + 1)")
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .frame(width: 34, alignment: .leading)
+
+            GeometryReader { geo in
+                let width = geo.size.width
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3).fill(Color.primary.opacity(0.08))
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(zoneColor(rms))
+                        .frame(width: fraction(of: rms) * width)
+                    // Peak-hold tick
+                    Rectangle()
+                        .fill(zoneColor(hold).opacity(0.9))
+                        .frame(width: 2)
+                        .offset(x: max(0, fraction(of: hold) * width - 1))
+                }
+            }
+            .frame(height: 10)
+
+            Text(String(format: "%.0f", hold))
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(zoneColor(hold))
+                .frame(width: 32, alignment: .trailing)
+        }
+    }
+
+    private func fraction(of db: Float) -> CGFloat {
+        CGFloat(min(max((db - floorDB) / (ceilingDB - floorDB), 0), 1))
+    }
+
+    private func zoneColor(_ db: Float) -> Color {
+        if db > -3 { return .red }
+        if db > -18 { return .green }
+        return .secondary
+    }
+}
+
 // MARK: - Sidebar
 
 struct SettingsSidebar: View {
@@ -124,9 +195,25 @@ struct SettingsSidebar: View {
                         Text(dev.label).tag(dev.id as UInt32?)
                     }
                 }
+                .onChange(of: model.inputDeviceID) { _ in model.restartMeterForDeviceChange() }
                 Stepper("In channel: \(model.inputChannel + 1)", value: $model.inputChannel, in: 0...63)
 
-                Button("Refresh devices") { model.refreshDevices() }
+                Toggle("Loop reference (dual-channel)", isOn: $model.useLoopReference)
+                if model.useLoopReference {
+                    Stepper("Loop channel: \(model.referenceChannel + 1)", value: $model.referenceChannel, in: 0...63)
+                    Text("Patch output \(model.referenceChannel + 1) back into input \(model.referenceChannel + 1). The sweep drives the speaker (out \(model.outputChannel + 1)) and the loop together — mic on in \(model.inputChannel + 1) measures the PA, the loop is the reference. Transfer function = mic ÷ loop, SMAART-style.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Button("Refresh devices") {
+                    model.refreshDevices()
+                    model.restartMeterForDeviceChange()
+                }
+            }
+
+            Section("Input levels") {
+                InputMeterView(meter: model.meter)
             }
 
             Section("Sweep") {
@@ -259,6 +346,77 @@ struct SettingsSidebar: View {
                 .disabled(model.isMeasuring)
             }
 
+            Section("Alignment Click") {
+                Text("Clicks main + subs together — nudge the offset until they land as one hit.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Stepper("Main ch: \(model.clickChannelA + 1)", value: $model.clickChannelA, in: 0...63)
+                    .onChange(of: model.clickChannelA) { _ in model.restartAlignmentClickIfRunning() }
+                Stepper("Sub ch: \(model.clickChannelB + 1)", value: $model.clickChannelB, in: 0...63)
+                    .onChange(of: model.clickChannelB) { _ in model.restartAlignmentClickIfRunning() }
+
+                LabeledContent("Sub offset") {
+                    HStack(spacing: 4) {
+                        TextField("", value: $model.clickDelayMsB, format: .number.precision(.fractionLength(1)))
+                            .frame(width: 56)
+                            .multilineTextAlignment(.trailing)
+                            .onSubmit { model.restartAlignmentClickIfRunning() }
+                        Text("ms").foregroundColor(.secondary)
+                    }
+                }
+                Slider(value: $model.clickDelayMsB, in: -50...50, step: 0.1) { _ in
+                    model.restartAlignmentClickIfRunning()
+                }
+                HStack(spacing: 4) {
+                    ForEach([-5.0, -1.0, -0.5, 0.5, 1.0, 5.0], id: \.self) { nudge in
+                        Button(nudge > 0 ? "+\(nudge, specifier: "%.1f")" : "\(nudge, specifier: "%.1f")") {
+                            model.clickDelayMsB += nudge
+                            model.restartAlignmentClickIfRunning()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                    Spacer()
+                    Button("Zero") {
+                        model.clickDelayMsB = 0
+                        model.restartAlignmentClickIfRunning()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                }
+
+                HStack {
+                    Text("Rate")
+                    Slider(value: $model.clickRateHz, in: 0.5...8, step: 0.5) { _ in
+                        model.restartAlignmentClickIfRunning()
+                    }
+                    Text(String(format: "%.1f Hz", model.clickRateHz))
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 46, alignment: .trailing)
+                }
+
+                HStack {
+                    Text("Level")
+                    Slider(value: $model.clickLevelDB, in: -50...0, step: 1) { _ in
+                        model.clickLevelChanged()
+                    }
+                    Text(String(format: "%.0f dB", model.clickLevelDB))
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 46, alignment: .trailing)
+                }
+
+                Button {
+                    model.toggleAlignmentClick()
+                } label: {
+                    Label(model.clickRunning ? "Stop" : "Start",
+                          systemImage: model.clickRunning ? "stop.fill" : "play.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .tint(model.clickRunning ? .red : nil)
+                .disabled(model.isMeasuring)
+            }
+
             Section("Files") {
                 Button("Load .pir...") { model.loadPIR() }
                 Button("Save .pir...") { model.savePIR() }
@@ -289,6 +447,38 @@ struct FRPanel: View {
                 }
                 .frame(maxWidth: 220)
                 .onChange(of: model.smoothing) { _ in model.recomputeFrequencyResponse() }
+
+                Picker("Gate window", selection: $model.gateTailFraction) {
+                    Text("Uniform").tag(0.0)
+                    Text("Hann 12%").tag(0.12)
+                    Text("Hann 25%").tag(0.25)
+                    Text("Hann 50%").tag(0.5)
+                }
+                .frame(maxWidth: 200)
+                .onChange(of: model.gateTailFraction) { _ in model.recomputeFrequencyResponse() }
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Picker("FFT", selection: $model.fftSize) {
+                        Text("4096").tag(4096)
+                        Text("8192").tag(8192)
+                        Text("16384").tag(16384)
+                        Text("32768").tag(32768)
+                        Text("65536").tag(65536)
+                        Text("131072").tag(131072)
+                    }
+                    .onChange(of: model.fftSize) { _ in model.recomputeFrequencyResponse() }
+
+                    if model.effectiveFFTSize != model.fftSize {
+                        Text("using \(model.effectiveFFTSize) (gate longer)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else if model.irSampleRate > 0 {
+                        Text(String(format: "%.2f Hz/bin", model.irSampleRate / Double(model.effectiveFFTSize)))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: 170)
 
                 Toggle("Phase", isOn: $model.showPhase)
                     .toggleStyle(.checkbox)
@@ -325,30 +515,108 @@ struct FRPanel: View {
 struct IRPanel: View {
     @EnvironmentObject var model: AppModel
 
+    private var empty: Bool { model.impulseResponse.isEmpty }
+    private var zoomed: Bool { model.irViewLength > 0 && !empty }
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("Click: gate start (cursor) · Shift-click: gate end (marker)")
+            HStack(spacing: 8) {
+                Text("Scroll: zoom · Shift-scroll: amplitude · Click: gate start · Shift-click: gate end")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer()
+
+                ControlGroup {
+                    Button {
+                        model.irZoom(factor: 0.5)
+                    } label: { Image(systemName: "plus.magnifyingglass") }
+                    .help("Zoom in (around the cursor)")
+                    .keyboardShortcut("=", modifiers: [])
+                    Button {
+                        model.irZoom(factor: 2.0)
+                    } label: { Image(systemName: "minus.magnifyingglass") }
+                    .help("Zoom out")
+                    .keyboardShortcut("-", modifiers: [])
+                }
+                .frame(width: 88)
+                .disabled(empty)
+
+                Button("Gate") { model.irZoomToGate() }
+                    .help("Zoom to fit the current gate")
+                    .disabled(empty || model.markerSample == nil)
+                Button("Fit") { model.irFit() }
+                    .help("Show the whole impulse response")
+                    .keyboardShortcut("0", modifiers: [])
+                    .disabled(empty || (!zoomed && model.irAmpZoom <= 1.01))
                 Button("Cursor to peak") {
                     model.cursorSample = max(0, model.peakIndex(of: model.impulseResponse) - 20)
                     model.recomputeFrequencyResponse()
                 }
-                .disabled(model.impulseResponse.isEmpty)
+                .disabled(empty)
+
+                Divider().frame(height: 16)
+
+                if model.frozenIR.isEmpty {
+                    Button("Freeze") { model.freezeIR() }
+                        .help("Snapshot this IR as a delay reference, then move the mic and measure again")
+                        .disabled(empty)
+                } else {
+                    Button("Clear ref") { model.clearFrozenIR() }
+                        .help("Remove the frozen reference IR")
+                    if let d = model.irDeltaMs {
+                        Text(String(format: "Δ %.2f ms · %.2f m", d, abs(d) / 1000 * 343))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.accentColor)
+                    }
+                }
             }
             .padding(8)
 
             IRPlotView(
                 samples: model.impulseResponse,
                 sampleRate: model.irSampleRate,
+                visibleStart: model.irVisibleRange.lowerBound,
+                visibleLength: max(model.irVisibleRange.count, 1),
+                ampZoom: model.irAmpZoom,
+                signalPeak: model.irPeak,
+                frozenSamples: model.frozenIR,
+                frozenPeak: model.frozenIRPeak,
+                frozenPeakIndex: model.frozenIRPeakIndex,
+                currentPeakIndex: model.irPeakIndex,
+                deltaMs: model.irDeltaMs,
                 cursorSample: $model.cursorSample,
                 markerSample: $model.markerSample,
-                onGateChanged: { model.recomputeFrequencyResponse() }
+                onGateChanged: { model.recomputeFrequencyResponse() },
+                onZoom: { factor, pivot in model.irZoom(factor: factor, center: pivot) },
+                onAmpZoom: { factor in model.irAmpZoomBy(factor) },
+                onPan: { delta in model.irPanBy(delta) }
             )
-            .padding([.leading, .trailing, .bottom], 8)
+            .padding([.leading, .trailing], 8)
+
+            if zoomed {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.left.and.right")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                    Slider(
+                        value: Binding(
+                            get: { Double(model.irVisibleRange.lowerBound) },
+                            set: { model.irViewStart = Int($0) }
+                        ),
+                        in: 0...Double(max(model.impulseResponse.count - model.irVisibleRange.count, 1))
+                    )
+                    Text(String(format: "%.0f–%.0f ms",
+                                Double(model.irVisibleRange.lowerBound) / model.irSampleRate * 1000,
+                                Double(model.irVisibleRange.upperBound) / model.irSampleRate * 1000))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .frame(width: 96, alignment: .trailing)
+                }
+                .padding(.horizontal, 8)
+                .padding(.top, 4)
+            }
         }
+        .padding(.bottom, 8)
     }
 }
 

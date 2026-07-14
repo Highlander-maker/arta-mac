@@ -2,6 +2,26 @@ import CoreAudio
 import AVFoundation
 import Foundation
 
+/// Shared mic-permission gate: any engine that taps an input node calls this first.
+func ensureMicrophonePermission() throws {
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized:
+        return
+    case .notDetermined:
+        let sema = DispatchSemaphore(value: 0)
+        var granted = false
+        AVCaptureDevice.requestAccess(for: .audio) { ok in
+            granted = ok
+            sema.signal()
+        }
+        sema.wait()
+        guard granted else { throw AudioError.message("Microphone permission was denied.") }
+    default:
+        throw AudioError.message(
+            "Microphone access is denied. Enable it in System Settings → Privacy & Security → Microphone.")
+    }
+}
+
 enum AudioError: Error, CustomStringConvertible {
     case coreAudio(OSStatus, String)
     case message(String)
@@ -132,5 +152,36 @@ enum AudioDevices {
     static func ensureDevice(_ deviceID: AudioDeviceID, on node: AVAudioIONode, what: String) throws {
         if currentDeviceID(on: node) == deviceID { return }
         try setDevice(deviceID, on: node, what: what)
+    }
+
+    /// Set the input device, then wait (bounded) for the node's HARDWARE input
+    /// format to adopt that device's real channel count, and return that format
+    /// for tap installation. Two macOS gotchas are handled here:
+    ///
+    ///  1. Switching to a non-default device on the shared AUHAL is asynchronous,
+    ///     so reading the format immediately after the set can catch a stale value.
+    ///  2. Crucially, `node.outputFormat(forBus:0)` (the graph side) stays pinned
+    ///     to a MONO downmix — verified: with a 2-in Scarlett set, inputFormat is
+    ///     2 ch but outputFormat reports 1 ch. Installing a tap at the output
+    ///     format silently drops every channel past the first, so a loop reference
+    ///     on input 2 is invisible. The fix is to tap at `inputFormat(forBus:0)`
+    ///     (the hardware side), which delivers all channels — confirmed 2-ch tap
+    ///     buffers on the Scarlett.
+    @discardableResult
+    static func ensureInputDeviceSettled(
+        _ deviceID: AudioDeviceID, on node: AVAudioIONode, what: String,
+        timeout: TimeInterval = 0.5
+    ) throws -> AVAudioFormat {
+        try ensureDevice(deviceID, on: node, what: what)
+        let expected = channelCount(deviceID, scope: kAudioObjectPropertyScopeInput)
+        var format = node.inputFormat(forBus: 0)
+        if expected > 0 {
+            let deadline = Date().addingTimeInterval(timeout)
+            while Int(format.channelCount) != expected && Date() < deadline {
+                usleep(10_000) // 10 ms
+                format = node.inputFormat(forBus: 0)
+            }
+        }
+        return format
     }
 }
