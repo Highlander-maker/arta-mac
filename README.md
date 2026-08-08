@@ -49,6 +49,55 @@ First launch will ask for microphone access — that's the measurement input.
    sound pre-delay is removed automatically, leaving the system's own phase —
    the number you're matching when aligning sub to tops at the crossover.
 
+### Delay between two sources (the Δ readout)
+
+Measuring how far apart two sources arrive — main vs delay ring, top vs sub —
+is a **Freeze**, not an overlay:
+
+1. Measure the first source (the reference — usually the main).
+2. **Freeze** on the Impulse tab. That snapshots its arrival time.
+3. Re-patch / move to the second source and measure again.
+4. Read **Δ** on the Impulse tab: the arrival difference in **ms and metres**.
+   Dial that into the processor, re-measure, and Δ should collapse to ~0.
+
+*Set as overlay* is a different tool — it keeps a **frequency response curve**
+for visual comparison and carries its phase, but it does **not** produce a Δ.
+Only Freeze does. With no frozen reference the Δ readout is simply absent.
+
+The Tone Burst tab (⌘B) has the same Freeze → Δ workflow for sub alignment,
+where a band-limited sweep's IR peak is too smeared to trust.
+
+### Trial delay and summation (aligning a crossover)
+
+A delay rotates phase linearly with frequency and leaves magnitude alone, so the
+sum of two measured sources at any delay is arithmetic on data you already have:
+`H_sum = H_A + H_B · e^(−j2πfτ)`. The **Trial delay** row on the FR tab does that
+live:
+
+1. Measure the first source, **Set as overlay**.
+2. Measure the second. Tick **Phase** and **Unwrap**, right-drag to the crossover band.
+3. Slide **Trial delay** — the live curve's phase trace rotates against the
+   overlay's. Line them up through the crossover. ± nudges by 0.05 ms.
+4. Tick **Combine** to draw the predicted sum. Phase-match says the sources agree;
+   the sum says what you'll actually hear, including how deep any notch is left.
+5. Dial the delay you landed on into the processor and re-measure to confirm.
+
+Both curves must carry a complex spectrum, so a `.frd` target loaded from disk
+can't take part. Overlays measured at a different FFT size or sample rate are
+refused rather than resampled — the app says why instead of drawing nothing.
+
+**It predicts the sum at that one mic position**, from data no better than the
+capture it came from. That's a limit of the physics, not of the method — the same
+limit applies to measuring it for real. What changes is that an iteration costs a
+second instead of a trip to the processor.
+
+### Zooming the frequency axis
+
+**Right-drag** across the FR plot to zoom to that band; **Esc** (or the range
+button in the toolbar) goes back to full range. Phase is unwrapped across the
+*visible* span only, so zooming to a crossover — say 30–200 Hz — is what makes
+two sources' phase traces readable enough to align on.
+
 ## Alignment tones (Generator)
 
 Continuous signals for sub/top delay and polarity work, on the selected
