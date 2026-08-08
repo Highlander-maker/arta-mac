@@ -13,6 +13,12 @@ final class GeneratorEngine {
         case sine(frequency: Double)
         case pink
         case pinkBand(center: Double, fraction: Int)
+        /// A shaped tone burst repeated with a settling gap — used to gain-stage a
+        /// burst measurement. Unlike a steady sine, it previews the *transient*
+        /// peak the real burst produces, so low-frequency room-mode buildup can't
+        /// make the meter over-read what the burst will actually deliver.
+        case burstTrain(frequency: Double, cycles: Int,
+                        envelope: SignalGenerator.BurstEnvelope = .raisedCosine)
     }
 
     private var engine: AVAudioEngine?
@@ -124,6 +130,23 @@ final class GeneratorEngine {
             let banded = BandFilters.bandpass(
                 signal: raw, center: f0, fraction: max(1, fraction), sampleRate: sampleRate)
             return seamlessNoiseLoop(banded, sampleRate: sampleRate)
+
+        case .burstTrain(let frequency, let cycles, let envelope):
+            let f = min(max(frequency, 10.0), sampleRate * 0.45)
+            let c = max(1, cycles)
+            // The same shaped burst the measurement fires — including its envelope,
+            // so the level preview stays a preview of the real thing — at ~unity
+            // peak. It tapers to zero at both ends, so appending a silent gap loops
+            // seamlessly.
+            let burst = SignalGenerator.shapedToneBurst(
+                frequency: f, cycles: c, sampleRate: sampleRate, amplitude: 0.95,
+                envelope: envelope)
+            // Gap ≥ three burst-lengths (min 400 ms) so low-frequency room modes
+            // decay between hits — otherwise successive bursts build the room up and
+            // the peak-hold over-reads what a single measurement burst delivers.
+            let burstSeconds = Double(burst.count) / sampleRate
+            let gapSeconds = max(0.4, burstSeconds * 3.0)
+            return burst + [Float](repeating: 0, count: Int(gapSeconds * sampleRate))
         }
     }
 

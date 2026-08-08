@@ -7,8 +7,10 @@ struct MainView: View {
 
     enum Tab: String, CaseIterable {
         case frequencyResponse = "Frequency Response"
+        case rta = "RTA"
         case impulse = "Impulse Response"
         case analysis = "Analysis"
+        case toneBurst = "Tone Burst"
         case room = "Room Acoustics"
     }
 
@@ -23,7 +25,7 @@ struct MainView: View {
                         ForEach(Tab.allCases, id: \.self) { Text($0.rawValue) }
                     }
                     .pickerStyle(.segmented)
-                    .frame(maxWidth: 520)
+                    .frame(maxWidth: 700)
 
                     Spacer()
                     MeasurementReadouts()
@@ -35,14 +37,16 @@ struct MainView: View {
 
                 switch tab {
                 case .frequencyResponse: FRPanel()
+                case .rta: RTAPanel()
                 case .impulse: IRPanel()
                 case .analysis: AnalysisPanel()
+                case .toneBurst: BurstPanel()
                 case .room: RoomPanel()
                 }
 
                 Divider()
                 HStack(spacing: 8) {
-                    if model.isMeasuring { ProgressView().controlSize(.small) }
+                    if model.isMeasuring || model.isBursting { ProgressView().controlSize(.small) }
                     if model.generatorRunning {
                         Label("GEN", systemImage: "dot.radiowaves.left.and.right")
                             .font(.system(size: 10, weight: .bold))
@@ -423,6 +427,9 @@ struct SettingsSidebar: View {
                     .disabled(model.impulseResponse.isEmpty)
                 Button("Export .frd...") { model.exportFRD() }
                     .disabled(model.currentFR == nil)
+                Button("Load burst...") { model.loadBurst() }
+                Button("Save burst...") { model.saveBurst() }
+                    .disabled(model.burstResult == nil)
             }
         }
         .formStyle(.grouped)
@@ -482,6 +489,22 @@ struct FRPanel: View {
 
                 Toggle("Phase", isOn: $model.showPhase)
                     .toggleStyle(.checkbox)
+                Toggle("Unwrap", isOn: $model.phaseUnwrap)
+                    .toggleStyle(.checkbox)
+                    .disabled(!model.showPhase)
+                    .help("Draw phase as one continuous line instead of wrapping at ±180°. Unwraps across the visible span, so zooming into the crossover also tidies it up.")
+
+                // Only shown while zoomed — it doubles as the readout of what
+                // band you're looking at, and as the discoverable way back out
+                // for anyone who hasn't found Esc.
+                if model.frIsZoomed {
+                    Button {
+                        model.frResetZoom()
+                    } label: {
+                        Label(zoomLabel, systemImage: "arrow.left.and.right")
+                    }
+                    .help("Showing \(zoomLabel). Click (or press Esc) for full range. Right-drag the plot to zoom.")
+                }
 
                 Spacer()
 
@@ -493,20 +516,209 @@ struct FRPanel: View {
             }
             .padding(8)
 
+            if model.trialDelayAvailable {
+                Divider()
+                trialDelayRow
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+            }
+
             FRPlotView(
                 curves: allCurves,
-                phase: model.currentPhase,
-                phaseFrequencies: model.currentFR?.frequencies ?? [],
-                showPhase: model.showPhase
+                showPhase: model.showPhase,
+                unwrapPhase: model.phaseUnwrap,
+                fLow: model.frLow,
+                fHigh: model.frHigh,
+                onZoomToRange: { model.frZoom(to: $0, $1) },
+                onResetZoom: { model.frResetZoom() }
             )
             .padding([.leading, .trailing, .bottom], 8)
         }
     }
 
+    /// Trial delay: slide it and the live curve's phase rotates against the frozen
+    /// overlay's. Magnitude can't move — a delay doesn't change it — so the
+    /// Combined trace is what shows whether the sum actually improved.
+    @ViewBuilder
+    private var trialDelayRow: some View {
+        HStack(spacing: 10) {
+            Text("Trial delay")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Slider(value: $model.trialDelayMs, in: -50...50)
+                .frame(minWidth: 140)
+
+            Text(String(format: "%+.2f ms · %+.2f m", model.trialDelayMs,
+                        Acoustics.distanceMeters(forDeltaMs: model.trialDelayMs)))
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .frame(width: 148, alignment: .leading)
+
+            Button("−") { model.nudgeTrialDelay(-0.05) }
+                .help("Nudge 0.05 ms earlier")
+            Button("+") { model.nudgeTrialDelay(0.05) }
+                .help("Nudge 0.05 ms later")
+            Button("Zero") { model.zeroTrialDelay() }
+                .disabled(model.trialDelayMs == 0)
+
+            Divider().frame(height: 16)
+
+            Toggle("Combine", isOn: $model.showCombined)
+                .toggleStyle(.checkbox)
+                .disabled(model.combinePartner == nil)
+                .help("Draw the predicted sum of the overlay and the delayed live curve")
+
+            if model.showCombined, model.combinableOverlays.count > 1 {
+                Picker("with", selection: $model.combineWithID) {
+                    ForEach(model.combinableOverlays) { overlay in
+                        Text(overlay.name).tag(overlay.id as UUID?)
+                    }
+                }
+                .frame(maxWidth: 150)
+            }
+
+            if model.showCombined, let reason = model.combineBlockedReason {
+                Text(reason)
+                    .font(.system(size: 10))
+                    .foregroundColor(.orange)
+                    .lineLimit(2)
+            }
+
+            Spacer()
+        }
+    }
+
     private var allCurves: [FRCurve] {
         var curves = model.overlays
-        if let current = model.currentFR { curves.append(current) }
+        // The delayed version of the live curve, so the phase trace follows the
+        // slider. Identical to `currentFR` when the trial delay is zero.
+        if let current = model.currentDisplayCurve { curves.append(current) }
+        if let combined = model.combinedCurve { curves.append(combined) }
         return curves
+    }
+
+    private var zoomLabel: String {
+        func fmt(_ f: Double) -> String {
+            f >= 1000 ? String(format: "%.1fk", f / 1000) : String(format: "%.0f", f)
+        }
+        return "\(fmt(model.frLow))–\(fmt(model.frHigh)) Hz"
+    }
+}
+
+// MARK: - RTA (live spectrum) panel
+
+/// Live spectrum of the input, running whenever this tab is showing. Reuses
+/// FRPlotView for the grid/log-frequency axis/hover readout, just on a dBFS scale.
+struct RTAPanel: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Picker("FFT", selection: $model.rtaFFTSize) {
+                    Text("2048").tag(2048)
+                    Text("4096").tag(4096)
+                    Text("8192").tag(8192)
+                    Text("16384").tag(16384)
+                    Text("32768").tag(32768)
+                }
+                .frame(maxWidth: 148)
+                .onChange(of: model.rtaFFTSize) { _ in model.restartRTAIfRunning() }
+
+                Picker("Smoothing", selection: $model.rtaSmoothing) {
+                    Text("None").tag(0)
+                    Text("1/1").tag(1)
+                    Text("1/3").tag(3)
+                    Text("1/6").tag(6)
+                    Text("1/12").tag(12)
+                    Text("1/24").tag(24)
+                }
+                .frame(maxWidth: 180)
+                .onChange(of: model.rtaSmoothing) { _ in model.restartRTAIfRunning() }
+
+                Picker("Average", selection: $model.rtaAveraging) {
+                    Text("Off").tag(RTASpectrum.Averaging.off)
+                    Text("Fast").tag(RTASpectrum.Averaging.fast)
+                    Text("Slow").tag(RTASpectrum.Averaging.slow)
+                }
+                .frame(maxWidth: 168)
+                .help("Fast = 125 ms, Slow = 1 s — the same time constants as an SPL meter.")
+                .onChange(of: model.rtaAveraging) { _ in model.restartRTAIfRunning() }
+
+                Toggle("Peak hold", isOn: $model.rtaPeakHold)
+                    .toggleStyle(.checkbox)
+                    .onChange(of: model.rtaPeakHold) { on in
+                        model.rta.peakHoldEnabled = on
+                        if !on { model.rta.resetPeakHold() }
+                    }
+                Button("Reset") { model.rta.resetPeakHold() }
+                    .disabled(!model.rtaPeakHold)
+
+                Spacer()
+
+                RTAStatusView(rta: model.rta, sampleRate: model.irSampleRate,
+                              fftSize: model.rtaFFTSize)
+            }
+            .padding(8)
+
+            RTAPlotView(rta: model.rta)
+                .padding([.leading, .trailing, .bottom], 8)
+        }
+        // The input device only supports one tap at a time, so the RTA runs
+        // exactly while its tab is visible and hands the input back on the way out.
+        .onAppear { model.startRTA() }
+        .onDisappear { model.stopRTA() }
+    }
+}
+
+/// Observes the RTA directly so its ~20 Hz updates redraw only the plot.
+private struct RTAPlotView: View {
+    @ObservedObject var rta: RTA
+
+    var body: some View {
+        FRPlotView(curves: curves, dbTop: 0, dbRange: 100)
+    }
+
+    private var curves: [FRCurve] {
+        guard !rta.frequencies.isEmpty else { return [] }
+        var out: [FRCurve] = []
+        // Peak hold drawn first so the live trace sits on top of it.
+        if !rta.peakHoldDB.isEmpty {
+            out.append(FRCurve(name: "Peak hold", frequencies: rta.frequencies,
+                               magnitudesDB: rta.peakHoldDB, color: PlotStyle.label))
+        }
+        if !rta.magnitudesDB.isEmpty {
+            out.append(FRCurve(name: "RTA", frequencies: rta.frequencies,
+                               magnitudesDB: rta.magnitudesDB, color: PlotStyle.trace))
+        }
+        return out
+    }
+}
+
+private struct RTAStatusView: View {
+    @ObservedObject var rta: RTA
+    let sampleRate: Double
+    let fftSize: Int
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let error = rta.error {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .lineLimit(1)
+            } else {
+                Text(String(format: "%.1f Hz/bin", sampleRate / Double(fftSize)))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Label("LIVE", systemImage: "waveform")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Capsule().fill(rta.running ? Color.green.opacity(0.85)
+                                                           : Color.gray.opacity(0.6)))
+            }
+        }
     }
 }
 
@@ -564,7 +776,7 @@ struct IRPanel: View {
                     Button("Clear ref") { model.clearFrozenIR() }
                         .help("Remove the frozen reference IR")
                     if let d = model.irDeltaMs {
-                        Text(String(format: "Δ %.2f ms · %.2f m", d, abs(d) / 1000 * 343))
+                        Text(String(format: "Δ %.2f ms · %.2f m", d, Acoustics.distanceMeters(forDeltaMs: abs(d))))
                             .font(.system(size: 11, weight: .semibold, design: .monospaced))
                             .foregroundColor(.accentColor)
                     }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds ArtaApp in release mode and wraps it into build/Arta.app so macOS
+# Builds ArtaApp in release mode and wraps it into build/smARTA.app so macOS
 # treats it as a real application (own microphone permission, Dock icon,
 # double-clickable). Ad-hoc signed so TCC grants stick between rebuilds.
 set -euo pipefail
@@ -7,11 +7,11 @@ cd "$(dirname "$0")/.."
 
 swift build -c release --product ArtaApp
 
-APP=build/Arta.app
+APP=build/smARTA.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-cp .build/release/ArtaApp "$APP/Contents/MacOS/Arta"
+cp .build/release/ArtaApp "$APP/Contents/MacOS/smARTA"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -19,13 +19,15 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>Arta</string>
+    <string>smARTA</string>
+    <!-- Deliberately still ...arta: macOS ties the microphone TCC grant to the
+         bundle identifier. Changing it would force a re-grant on next launch. -->
     <key>CFBundleIdentifier</key>
     <string>com.highlanderaudio.arta</string>
     <key>CFBundleName</key>
-    <string>Arta</string>
+    <string>smARTA</string>
     <key>CFBundleDisplayName</key>
-    <string>Arta</string>
+    <string>smARTA</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -37,7 +39,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Arta records the measurement input while playing the excitation signal. Without microphone access no measurement is possible.</string>
+    <string>smARTA records the measurement input while playing the excitation signal. Without microphone access no measurement is possible.</string>
 </dict>
 </plist>
 PLIST

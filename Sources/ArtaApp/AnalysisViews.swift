@@ -55,7 +55,10 @@ struct AnalysisPanel: View {
             }
             .padding([.leading, .trailing, .bottom], 8)
         }
-        .onChange(of: model.impulseResponse.count) { _ in
+        // Keyed on the generation counter, not the sample count: two sweeps at
+        // the same settings produce IRs of identical length, so the count never
+        // changed and the previous measurement's ETC/step/CSD stayed on screen.
+        .onChange(of: model.irGeneration) { _ in
             etc = []; step = []; csd = []
         }
     }

@@ -16,6 +16,7 @@ enum PlotStyle {
     static let trace = Color(red: 1.00, green: 0.72, blue: 0.20)   // amber
     static let phase = Color(red: 0.30, green: 0.78, blue: 0.95)   // cyan
     static let target = Color(red: 0.95, green: 0.36, blue: 0.32)  // signal red
+    static let combined = Color(red: 0.43, green: 0.56, blue: 0.91) // predicted sum
     static let cursor = Color(white: 0.9).opacity(0.65)
     static let gateFill = Color(red: 1.00, green: 0.72, blue: 0.20).opacity(0.07)
     static let overlayPalette: [Color] = [
@@ -41,16 +42,91 @@ enum PlotStyle {
 // MARK: - Frequency response plot (log-frequency, dB magnitude, optional phase)
 
 struct FRPlotView: View {
+    /// The full audio span the axis defaults to, and the limits any zoom is
+    /// clamped into. Shared with `AppModel`'s zoom state so "full range" means
+    /// the same thing in both places.
+    static let fullLow: Double = 20
+    static let fullHigh: Double = 20_000
+
+    /// Ignore a right-drag shorter than this — a stray right-click shouldn't
+    /// zoom the axis into a sliver.
+    private static let minDragPixels: CGFloat = 6
+
     let curves: [FRCurve]
-    var phase: [Float] = []
-    var phaseFrequencies: [Double] = []
     var showPhase = false
-    var fLow: Double = 20
-    var fHigh: Double = 20_000
+    var unwrapPhase = false
+    var fLow: Double = FRPlotView.fullLow
+    var fHigh: Double = FRPlotView.fullHigh
     var dbTop: Double = 20
     var dbRange: Double = 80
+    /// Right-drag a band to zoom the frequency axis. Omit for a fixed-axis plot.
+    var onZoomToRange: ((Double, Double) -> Void)? = nil
+    /// Escape → back to full range. Returns true if there was a zoom to undo.
+    var onResetZoom: (() -> Bool)? = nil
 
     @State private var hoverLocation: CGPoint? = nil
+    @State private var dragBand: DragBand? = nil
+
+    /// Pixel bounds of an in-progress right-drag selection.
+    private struct DragBand {
+        var start: CGFloat
+        var current: CGFloat
+    }
+
+    /// Phase traces, one per curve that carries phase, clipped to the visible band
+    /// and unwrapped if asked.
+    ///
+    /// Clipping *before* unwrapping is deliberate: outside the sweep band the
+    /// deconvolution has nothing to divide by and returns noise, and unwrapping
+    /// through that noise accumulates a bogus offset that corrupts the in-band
+    /// slope. Restricting to what's on screen means zooming into the crossover
+    /// also cleans up the unwrap.
+    private var phaseTraces: [(color: Color, points: [(f: Double, deg: Double)])] {
+        guard showPhase else { return [] }
+        return curves.compactMap { curve in
+            guard !curve.phaseDegrees.isEmpty else { return nil }
+            let n = min(curve.frequencies.count, curve.phaseDegrees.count)
+            var freqs: [Double] = []
+            var raw: [Float] = []
+            for i in 0..<n {
+                let f = curve.frequencies[i]
+                guard f >= fLow, f <= fHigh else { continue }
+                freqs.append(f)
+                raw.append(curve.phaseDegrees[i])
+            }
+            guard freqs.count > 1 else { return nil }
+            let degs = unwrapPhase ? PhaseUnwrap.degrees(raw) : raw.map(Double.init)
+            return (curve.color, Array(zip(freqs, degs)).map { (f: $0.0, deg: $0.1) })
+        }
+    }
+
+    /// Phase axis bounds: fixed ±180° when wrapped, fitted to the data when
+    /// unwrapped (rounded out to whole 90° steps so the gridlines stay meaningful).
+    private var phaseBounds: (low: Double, high: Double) {
+        guard unwrapPhase else { return (-180, 180) }
+        var low = Double.greatestFiniteMagnitude
+        var high = -Double.greatestFiniteMagnitude
+        for trace in phaseTraces {
+            for point in trace.points {
+                low = min(low, point.deg)
+                high = max(high, point.deg)
+            }
+        }
+        guard low < high else { return (-180, 180) }
+        let pad = max((high - low) * 0.08, 15)
+        return (((low - pad) / 90).rounded(.down) * 90,
+                ((high + pad) / 90).rounded(.up) * 90)
+    }
+
+    /// Up to 5 evenly-spaced labelled phase gridlines across whatever range is in use.
+    private var phaseTicks: [Double] {
+        let bounds = phaseBounds
+        guard unwrapPhase else { return [180, 90, 0, -90, -180] }
+        let span = bounds.high - bounds.low
+        guard span > 0 else { return [0] }
+        let step = max((span / 4 / 90).rounded() * 90, 90)
+        return stride(from: bounds.low, through: bounds.high, by: step).map { $0 }
+    }
 
     private let decadeTicks: [Double] = [
         20, 30, 40, 50, 60, 80, 100, 200, 300, 400, 500, 600, 800,
@@ -58,15 +134,49 @@ struct FRPlotView: View {
     ]
     private let labeledTicks: [Double] = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10_000, 20_000]
 
+    /// Frequency gridlines for whatever span is visible, and whether each is
+    /// labelled. The fixed decade set thins out badly once you zoom into a
+    /// crossover — 60–90 Hz leaves a single tick and no label at all — so a
+    /// narrow span falls back to evenly-spaced round numbers, all labelled.
+    private var frequencyTicks: [(f: Double, labeled: Bool)] {
+        let inSpan = decadeTicks.filter { $0 >= fLow && $0 <= fHigh }
+        if inSpan.count >= 4 {
+            return inSpan.map { ($0, labeledTicks.contains($0)) }
+        }
+        let target = (fHigh - fLow) / 5
+        guard target > 0 else { return inSpan.map { ($0, true) } }
+        let magnitude = pow(10, log10(target).rounded(.down))
+        let step = [1.0, 2.0, 5.0, 10.0].first { magnitude * $0 >= target }.map { magnitude * $0 }
+            ?? magnitude * 10
+        var ticks: [(f: Double, labeled: Bool)] = []
+        var f = (fLow / step).rounded(.up) * step
+        while f <= fHigh {
+            ticks.append((f, true))
+            f += step
+        }
+        return ticks.isEmpty ? inSpan.map { ($0, true) } : ticks
+    }
+
+    /// Axis label for a frequency. Handles the zoomed-in cases the old
+    /// `Int(f / 1000)` formatting got wrong — 1200 Hz read as "1k".
+    private func tickLabel(_ f: Double) -> String {
+        if f >= 1000 {
+            let k = f / 1000
+            return k == k.rounded() ? "\(Int(k))k" : String(format: "%.1fk", k)
+        }
+        return f == f.rounded() ? "\(Int(f))" : String(format: "%.1f", f)
+    }
+
     var body: some View {
         PlotStyle.panel(
             Canvas { context, size in
                 drawGrid(context: context, size: size)
-                if showPhase, !phase.isEmpty {
-                    drawPhase(context: context, size: size)
-                }
+                drawPhase(context: context, size: size)
                 for curve in curves {
                     drawCurve(curve, context: context, size: size)
+                }
+                if let band = dragBand {
+                    drawDragBand(band, context: context, size: size)
                 }
                 drawLegend(context: context, size: size)
                 if let hover = hoverLocation {
@@ -79,7 +189,25 @@ struct FRPlotView: View {
                 case .ended: hoverLocation = nil
                 }
             }
+            .overlay(zoomGestureCatcher)
         )
+    }
+
+    @ViewBuilder
+    private var zoomGestureCatcher: some View {
+        if let onZoomToRange {
+            DragZoomCatcher(
+                onDragChanged: { start, current, _ in
+                    dragBand = DragBand(start: start, current: current)
+                },
+                onDragEnded: { start, end, size in
+                    dragBand = nil
+                    guard size.width > 0, abs(end - start) >= Self.minDragPixels else { return }
+                    onZoomToRange(fFor(min(start, end), size), fFor(max(start, end), size))
+                },
+                onEscape: { onResetZoom?() ?? false }
+            )
+        }
     }
 
     private func xFor(_ f: Double, _ size: CGSize) -> CGFloat {
@@ -99,25 +227,26 @@ struct FRPlotView: View {
     }
 
     private func yForPhase(_ degrees: Double, _ size: CGSize) -> CGFloat {
-        CGFloat((180.0 - degrees) / 360.0) * size.height
+        let bounds = phaseBounds
+        let span = bounds.high - bounds.low
+        guard span > 0 else { return size.height / 2 }
+        return CGFloat((bounds.high - degrees) / span) * size.height
     }
 
     private func drawGrid(context: GraphicsContext, size: CGSize) {
-        for f in decadeTicks where f >= fLow && f <= fHigh {
-            let x = xFor(f, size)
-            let major = labeledTicks.contains(f)
+        for tick in frequencyTicks {
+            let x = xFor(tick.f, size)
             var path = Path()
             path.move(to: CGPoint(x: x, y: 0))
             path.addLine(to: CGPoint(x: x, y: size.height))
-            context.stroke(path, with: .color(major ? PlotStyle.gridMajor : PlotStyle.gridMinor),
-                           lineWidth: major ? 1 : 0.5)
-            if major {
-                let label = f >= 1000 ? "\(Int(f / 1000))k" : "\(Int(f))"
+            context.stroke(path, with: .color(tick.labeled ? PlotStyle.gridMajor : PlotStyle.gridMinor),
+                           lineWidth: tick.labeled ? 1 : 0.5)
+            if tick.labeled {
                 // Keep the label inside the plot: the rightmost tick (e.g. 20k)
                 // sits on the edge, so anchor it trailing instead of leading.
                 let nearRight = x > size.width - 24
                 context.draw(
-                    Text(label).font(PlotStyle.labelFont).foregroundColor(PlotStyle.label),
+                    Text(tickLabel(tick.f)).font(PlotStyle.labelFont).foregroundColor(PlotStyle.label),
                     at: CGPoint(x: nearRight ? x - 3 : x + 3, y: size.height - 9),
                     anchor: nearRight ? .trailing : .leading)
             }
@@ -135,38 +264,51 @@ struct FRPlotView: View {
                 at: CGPoint(x: 4, y: y - 7), anchor: .leading)
             db -= 10
         }
-        if showPhase {
-            for deg in [180, 90, 0, -90, -180] {
+        // Phase axis labels are neutral grey now that each phase trace takes its
+        // own curve's colour — a single cyan axis would imply one cyan trace.
+        if showPhase, !phaseTraces.isEmpty {
+            let bounds = phaseBounds
+            for deg in phaseTicks {
+                let y = yForPhase(deg, size)
+                guard y.isFinite else { continue }
+                let nudge: CGFloat = deg >= bounds.high - 0.5 ? 8 : (deg <= bounds.low + 0.5 ? -8 : 0)
                 context.draw(
-                    Text("\(deg)°").font(PlotStyle.labelFont)
-                        .foregroundColor(PlotStyle.phase.opacity(0.8)),
-                    at: CGPoint(x: size.width - 4, y: yForPhase(Double(deg), size) + (deg == 180 ? 8 : deg == -180 ? -8 : 0)),
+                    Text("\(Int(deg))°").font(PlotStyle.labelFont)
+                        .foregroundColor(PlotStyle.label.opacity(0.9)),
+                    at: CGPoint(x: size.width - 4, y: y + nudge),
                     anchor: .trailing)
             }
         }
     }
 
+    /// One dashed trace per curve carrying phase, in that curve's own colour, so
+    /// two sources' phase can be followed independently through the crossover.
+    /// Dashed vs solid is what separates phase from magnitude at the same colour.
     private func drawPhase(context: GraphicsContext, size: CGSize) {
-        var path = Path()
-        var started = false
-        var lastY: CGFloat? = nil
-        for i in 0..<min(phase.count, phaseFrequencies.count) {
-            let f = phaseFrequencies[i]
-            guard f >= fLow, f <= fHigh else { continue }
-            let point = CGPoint(x: xFor(f, size), y: yForPhase(Double(phase[i]), size))
-            // Break the line at ±180° wraps instead of drawing vertical strokes.
-            if started, let ly = lastY, abs(point.y - ly) > size.height * 0.5 {
-                started = false
+        for trace in phaseTraces {
+            var path = Path()
+            var started = false
+            var lastY: CGFloat? = nil
+            for point in trace.points {
+                let p = CGPoint(x: xFor(point.f, size), y: yForPhase(point.deg, size))
+                guard p.y.isFinite else { continue }
+                // Wrapped phase jumps the full plot height at ±180 — break the line
+                // there rather than stroking a vertical bar across the graph.
+                // Unwrapped phase is continuous, so it never needs breaking.
+                if !unwrapPhase, started, let ly = lastY, abs(p.y - ly) > size.height * 0.5 {
+                    started = false
+                }
+                if started {
+                    path.addLine(to: p)
+                } else {
+                    path.move(to: p)
+                    started = true
+                }
+                lastY = p.y
             }
-            if started {
-                path.addLine(to: point)
-            } else {
-                path.move(to: point)
-                started = true
-            }
-            lastY = point.y
+            context.stroke(path, with: .color(trace.color.opacity(0.9)),
+                           style: StrokeStyle(lineWidth: 1.1, lineJoin: .round, dash: [3, 2]))
         }
-        context.stroke(path, with: .color(PlotStyle.phase.opacity(0.85)), lineWidth: 1.1)
     }
 
     private func drawCurve(_ curve: FRCurve, context: GraphicsContext, size: CGSize) {
@@ -184,17 +326,40 @@ struct FRPlotView: View {
                 started = true
             }
         }
-        let style = StrokeStyle(lineWidth: curve.isTarget ? 1.3 : 1.7,
+        let style = StrokeStyle(lineWidth: curve.isTarget || curve.isCombined ? 1.3 : 1.7,
                                 lineJoin: .round,
                                 dash: curve.isTarget ? [6, 3] : [])
         context.stroke(path, with: .color(curve.color), style: style)
     }
 
+    /// The band being selected by an in-progress right-drag: a low-alpha fill so
+    /// the traces underneath stay readable, hard edges, and a live Hz readout —
+    /// you're picking a frequency window, so the numbers matter more than the box.
+    private func drawDragBand(_ band: DragBand, context: GraphicsContext, size: CGSize) {
+        let x0 = min(band.start, band.current)
+        let x1 = max(band.start, band.current)
+        guard x1 - x0 > 0.5 else { return }
+
+        context.fill(Path(CGRect(x: x0, y: 0, width: x1 - x0, height: size.height)),
+                     with: .color(.white.opacity(0.10)))
+        for x in [x0, x1] {
+            var edge = Path()
+            edge.move(to: CGPoint(x: x, y: 0))
+            edge.addLine(to: CGPoint(x: x, y: size.height))
+            context.stroke(edge, with: .color(PlotStyle.cursor), lineWidth: 1)
+        }
+        context.draw(
+            Text("\(tickLabel(fFor(x0, size)))–\(tickLabel(fFor(x1, size))) Hz")
+                .font(PlotStyle.readoutFont).foregroundColor(.white),
+            at: CGPoint(x: (x0 + x1) / 2, y: size.height - 26), anchor: .center)
+    }
+
     private func drawLegend(context: GraphicsContext, size: CGSize) {
         var y: CGFloat = 10
         var entries: [(String, Color, Bool)] = curves.map { ($0.name, $0.color, $0.isTarget) }
-        if showPhase, !phase.isEmpty { entries.append(("Phase", PlotStyle.phase, false)) }
-        guard entries.count > 1 || showPhase else { return }
+        // Phase shares each curve's colour, so the legend just explains the dashes.
+        if !phaseTraces.isEmpty { entries.append(("phase (dashed)", PlotStyle.label, true)) }
+        guard entries.count > 1 else { return }
         for (name, color, dashed) in entries {
             var line = Path()
             line.move(to: CGPoint(x: 10, y: y))
@@ -220,8 +385,10 @@ struct FRPlotView: View {
         if let main = curves.last(where: { !$0.isTarget }),
            let idx = nearestIndex(in: main.frequencies, to: f) {
             readout += String(format: "  %.1f dB", main.magnitudesDB[idx])
-            if showPhase, idx < phase.count {
-                readout += String(format: "  %.0f°", phase[idx])
+            // Read phase off the same curve the dB figure came from, so the two
+            // numbers under the cursor always describe one measurement.
+            if showPhase, idx < main.phaseDegrees.count {
+                readout += String(format: "  %.0f°", main.phaseDegrees[idx])
             }
         }
         let anchor: UnitPoint = location.x > size.width - 170 ? .trailing : .leading
@@ -421,7 +588,7 @@ struct IRPlotView: View {
                 at: CGPoint(x: refX + 3, y: 22), anchor: .leading)
         }
         let curX = xFor(currentPeakIndex, size.width)
-        let distance = abs(delta) / 1000.0 * 343.0
+        let distance = Acoustics.distanceMeters(forDeltaMs: abs(delta))
         let text = String(format: "Δ %.2f ms   %.2f m", delta, distance)
         let cx = min(max((refX + curX) / 2, 70), size.width - 70)
         context.draw(

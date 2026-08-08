@@ -37,6 +37,27 @@ public enum Deconvolution {
         return (lag, min(coeff, 1.0))
     }
 
+    /// Index of the largest-magnitude sample — the direct sound in a deconvolved
+    /// impulse response.
+    ///
+    /// Prefer this over `estimateDelay` for propagation time. `estimateDelay` is a
+    /// raw cross-correlation, so with a log sweep it inherits the excitation's own
+    /// pink (∝1/f) energy weighting: the correlation peak is dominated by low
+    /// frequencies, which are long-wavelength, time-smeared and modal. In a
+    /// reverberant space that drags the peak toward wherever the bass energy piles
+    /// up — measured 16 ms late on a 7.7 m throw at −18 dB correlation (21 Jul 2026).
+    /// `impulseResponse` divides by |X|², whitening the spectrum, so its peak is a
+    /// sharp delta at the true arrival.
+    public static func peakIndex(of ir: [Float]) -> Int {
+        var idx = 0
+        var best: Float = -.infinity
+        for i in 0..<ir.count where abs(ir[i]) > best {
+            best = abs(ir[i])
+            idx = i
+        }
+        return idx
+    }
+
     /// Impulse response by spectral division H = Y·conj(X) / (|X|² + ε), h = IFFT(H).
     /// Works for any excitation with energy across the band (sweep, noise, MLS).
     /// `relativeRegularization` guards division in bands where the excitation has

@@ -48,6 +48,65 @@ public enum SignalGenerator {
         return out
     }
 
+    /// Envelope shaping the tone burst. Both are symmetric about T/2, so the arrival
+    /// detector's "envelope peak = burst centre" assumption holds for either.
+    public enum BurstEnvelope: String, Codable, CaseIterable, Sendable {
+        /// Full raised cosine, w(t) = ½ − ½cos(2πt/T). Linkwitz's original.
+        case raisedCosine
+        /// Gaussian (Gabor) pulse. Uniquely minimises the time–bandwidth product,
+        /// so it is the most sharply localised burst available in both domains at
+        /// once — the reason it gives the cleanest centre to align to. Jonathan
+        /// Digby specifies this envelope for wavelet alignment work.
+        case gaussian
+    }
+
+    /// Shaped tone burst (Linkwitz, JAES 1980): `cycles` of a sine at `frequency`
+    /// multiplied by a symmetric envelope, where the burst length T = cycles /
+    /// frequency. The envelope tapers the burst to zero at both ends, confining its
+    /// spectrum to ≈⅓ octave around f0 and killing the click a rectangular burst
+    /// would make. Played into a system, the PEAK of the received burst's envelope
+    /// is the frequency-response magnitude at f0, while the SHAPE of that envelope
+    /// (slow build-up, extended ring-out) exposes localized resonances a swept
+    /// measurement smooths over.
+    ///
+    /// On `cycles`: 5 is Linkwitz's figure and what Digby uses — enough ramp to show
+    /// the shape, short enough that the envelope peak stays sharp and catches fewer
+    /// reflections. Pat Brown's published wavelet library uses 6.5, which is what
+    /// puts it at ~⅓-octave bandwidth. Either aligns; longer bursts trade centre
+    /// sharpness for frequency selectivity.
+    public static func shapedToneBurst(
+        frequency: Double,
+        cycles: Int = 5,
+        sampleRate: Double,
+        amplitude: Double = 0.5,
+        envelope: BurstEnvelope = .raisedCosine
+    ) -> [Float] {
+        precondition(frequency > 0 && cycles > 0 && sampleRate > 0)
+        let burstLength = Double(cycles) / frequency        // T, seconds
+        let n = max(1, Int((burstLength * sampleRate).rounded()))
+        // Gaussian truncated at ±3σ: the untruncated curve never reaches zero, and a
+        // step at the ends would splatter the spectrum the taper exists to contain.
+        // The 3σ pedestal (e^-4.5 ≈ 0.011) is subtracted and the result renormalised,
+        // so the burst starts and ends at exactly zero and still peaks at 1.
+        let sigma = burstLength / 6.0
+        let pedestal = exp(-4.5)
+        var out = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            let t = Double(i) / sampleRate
+            let window: Double
+            switch envelope {
+            case .raisedCosine:
+                window = 0.5 - 0.5 * cos(2.0 * .pi * t / burstLength)
+            case .gaussian:
+                let z = (t - burstLength / 2) / sigma
+                window = max(0, (exp(-0.5 * z * z) - pedestal) / (1 - pedestal))
+            }
+            let carrier = sin(2.0 * .pi * frequency * t)
+            out[i] = Float(amplitude * window * carrier)
+        }
+        return out
+    }
+
     public static func sine(frequency: Double, duration: Double, sampleRate: Double, amplitude: Double = 0.5) -> [Float] {
         let n = Int(duration * sampleRate)
         return (0..<n).map { Float(amplitude * sin(2.0 * .pi * frequency * Double($0) / sampleRate)) }
